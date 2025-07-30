@@ -115,8 +115,8 @@ def extract_edit_function(text: str, functions: List[str]) -> Optional[str]:
     return results[0] if results else None
 
 def extract_dafny_program(text: str) -> str:
-    text = remove_think_blocks(text)
     """Extract the Dafny program between the markers."""
+    text = remove_think_blocks(text)
     start_marker = '// BEGIN DAFNY'
     end_marker = '// END DAFNY'
     start_idx = text.find(start_marker)
@@ -171,7 +171,7 @@ def erase_implementation(p: str, todo) -> str:
     return xp
 
 def insert_program_todo(todo, p, x):
-    if todo['status'] == 'done':
+    if todo['status'] != 'todo':
         lines = p.splitlines(keepends=True)
         start_offset = line_col_to_start_offset(p,lines, todo['insertLine'], todo['insertColumn'])
         end_offset = line_col_to_end_offset(p, lines, todo['endLine'], todo['endColumn'])
