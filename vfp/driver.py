@@ -37,7 +37,10 @@ def drive_program(p: str, max_iterations: Optional[int] = None, cache=None) -> s
         i += 1
         todo = sketcher.sketch_next_todo(p)
         done = sketcher.sketch_done(p)
+        print(f"=== Iteration {i} ===")
+        print(f"Next todo: {todo}")
         if todo is None:
+            print("No more todos - finished!")
             return p
         xp = dispatch_implementer(p, todo, done, cache=cache)
         if xp is None:
@@ -79,11 +82,13 @@ def lemma_implementer(p: str, todo, done, cache=None) -> str:
         print("Induction sketcher works!")
         return xp
     ip = insert_program_todo(todo, p, "")
+    print(f"Generating counterexamples for {todo['name']}")
     cs = sketcher.sketch_counterexamples(ip, todo['name'])
+    print("Counterexamples:", cs)
     if cs:
         cs_str = "\n".join(cs)
         # TODO: could force the edit further
-        return llm_implementer(p, todo, done=done, hint="We found the following counterexamples to the lemma:\n" + cs_str+ "\nConsider editing the code instead of continuing to prove an impossible lemma.", edit_hint="A previous attempt had the following counterexamples for a desired property -- consider these carefully:\n" + cs_str)
+        return llm_implementer(p, todo, done=done, hint="We found the following counterexamples to the lemma:\n" + cs_str+ "\nConsider editing the code instead of continuing to prove an impossible lemma. If you do choose to edit the code, make sure to follow the existing syntax in the file as closely as possible, to keep consistency of style.", edit_hint="A previous attempt had the following counterexamples for a desired property -- consider these carefully:\n" + cs_str)
     return llm_implementer(p, todo, done=done, hint="This induction sketch did NOT work on its own, but could be a good starting point if you vary/augment it:\n" + x, cache=cache)
 
 def llm_implementer(p: str, todo, prev: str = None, hint: str = None, done: list[object] = None, edit_hint: str = None, cache=None) -> str:
@@ -126,9 +131,15 @@ def llm_edit_function(p: str, todo, done, edit_function, hint: str = None, cache
     print('EDIT', edit_function)
     edit_todo = [u for u in done if u['name'] == edit_function][0]
     p = erase_implementation(p, edit_todo)
+    # Re-fetch the todo from the erased program since line numbers have changed
+    todos = sketcher.sketch_todo(p)
+    edit_todo = [u for u in todos if u['name'] == edit_function][0]
     xp = llm_implementer(p, edit_todo, hint=f"You chose to re-implement {edit_function} instead of implementing {todo['name']}." + " "+hint if hint else "", cache=cache)
     if xp is None:
-        return p
+        return None  # Return None so caller knows edit failed
+    # After successfully editing the function, return the updated program
+    # The main loop will pick up the original lemma as the next todo
+    print(f"Successfully re-implemented {edit_function}, continuing to next todo...")
     return xp
 
 def remove_think_blocks(text):
