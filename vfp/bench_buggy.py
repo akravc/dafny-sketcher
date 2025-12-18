@@ -13,14 +13,17 @@ import sketcher
 import tests
 
 
-def run_buggy_benchmark(max_iterations: int = 5):
-    """Run the driver workflow on all buggy files in bench/."""
-    # Find all *_buggy.dfy files
-    buggy_files = sorted(glob.glob("bench/*_buggy.dfy"))
-    
-    print(f"Found {len(buggy_files)} buggy files:")
-    for f in buggy_files:
-        print(f"  - {f}")
+def run_buggy_benchmark(max_iterations: int = 5, single_file: str = None):
+    """Run the driver workflow on files in buggy_bench/ or a single file."""
+    if single_file:
+        buggy_files = [single_file]
+        print(f"Running on single file: {single_file}")
+    else:
+        # Find all .dfy files in buggy_bench
+        buggy_files = sorted(glob.glob("buggy_bench/*.dfy"))
+        print(f"Found {len(buggy_files)} buggy files:")
+        for f in buggy_files:
+            print(f"  - {f}")
     print()
     
     solved = []
@@ -139,7 +142,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run buggy Dafny benchmark')
     parser.add_argument('--max-iterations', type=int, default=5,
                         help='Maximum LLM repair iterations per program (default: 5)')
+    parser.add_argument('--file', type=str, default=None,
+                        help='Run on a single file instead of all files in buggy_bench/')
     args = parser.parse_args()
     
-    # Run on all buggy files
-    run_buggy_benchmark(max_iterations=args.max_iterations)
+    run_buggy_benchmark(max_iterations=args.max_iterations, single_file=args.file)
