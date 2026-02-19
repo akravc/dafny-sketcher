@@ -6,6 +6,7 @@ Usage:
 Adds dafny_sketcher tool for proof sketching assistance.
 """
 
+import json
 import os
 import subprocess
 import tempfile
@@ -79,11 +80,74 @@ class DafnySketcherTool(Tool):
             return f"[error: {e}]"
 
 
+class LemmaInsertLineTool(Tool):
+    """Get the line number where to insert a lemma body (the opening brace line)."""
+
+    name = "lemma_insert_line"
+    description = """Returns the line number of the opening brace for a lemma body.
+    This is the line where you would insert the proof body for a lemma."""
+
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the .dfy file",
+            },
+            "lemma_name": {
+                "type": "string",
+                "description": "Name of the lemma to find the insert line for",
+            },
+        },
+        "required": ["path", "lemma_name"],
+    }
+    requires_permission = True
+
+    def execute(self, path: str, lemma_name: str) -> str:
+        try:
+            # Get todo_lemmas to find the lemma
+            cmd = ["dotnet", CLI_DLL, "--file", path, "--sketch", "todo_lemmas"]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            
+            if result.returncode != 0:
+                return f"[error: dafny-sketcher failed: {result.stderr}]"
+            
+            # Parse JSON output
+            try:
+                todos = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                return f"[error: failed to parse JSON output: {result.stdout}]"
+            
+            # Find the lemma with matching name
+            for todo in todos:
+                if todo.get('name') == lemma_name and todo.get('type') == 'lemma':
+                    insert_line = todo.get('insertLine')
+                    if insert_line is not None:
+                        return str(insert_line)
+                    else:
+                        return f"[error: lemma '{lemma_name}' found but missing insertLine field]"
+            
+            return f"[error: lemma '{lemma_name}' not found in todo_lemmas]"
+            
+        except FileNotFoundError:
+            return f"[error: dotnet or CLI not found. Ensure dotnet is installed and CLI is built at {CLI_DLL}]"
+        except subprocess.TimeoutExpired:
+            return "[error: dafny-sketcher timed out after 120 seconds]"
+        except Exception as e:
+            return f"[error: {e}]"
+
+
 # Tools to add
-TOOLS = [DafnySketcherTool()]
+TOOLS = [DafnySketcherTool(), LemmaInsertLineTool()]
 
 # Make dafny_sketcher path-based (per-path "always")
-PATH_BASED = {"dafny_sketcher"}
+PATH_BASED = {"dafny_sketcher", "lemma_insert_line"}
 
 # Auto-allow dafny_sketcher within cwd
-AUTO_ALLOW_CWD = {"dafny_sketcher"}
+AUTO_ALLOW_CWD = {"dafny_sketcher", "lemma_insert_line"}

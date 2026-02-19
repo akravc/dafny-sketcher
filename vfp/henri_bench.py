@@ -90,10 +90,10 @@ def run_henri(problem_file_path, lemmaName, use_sketcher=False, timeout=300, max
     # Stats file has same base name as problem file but with .json extension
     stats_file = str(Path(problem_file_path).with_suffix('.json'))
     cmd.extend(['--stats-file', stats_file])
+    cmd.extend(['--default-response', "I want you to verify this lemma as you see fit."])
 
     start_time = time.time()
     try:
-        # Don't capture output - let it stream to terminal
         result = subprocess.run(
             cmd,
             input=prompt,
