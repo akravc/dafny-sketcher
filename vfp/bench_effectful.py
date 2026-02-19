@@ -9,12 +9,11 @@ Usage:
     python bench_effectful.py --file bench/binary_search_solution.dfy
     python bench_effectful.py --file bench/reverse_solution.dfy --lemma reverseLength
     USE_SKETCHERS=true python bench_effectful.py
-    MAX_ITERS=5 python bench_effectful.py
 
 Environment variables:
     USE_SKETCHERS: Set to 'false' to disable sketcher tools (default: true)
-    MAX_ITERS: Maximum LLM repair iterations (default: 3)
     LLM_MODEL: litellm model string (default: from LLM_MODEL env or "gpt-4o")
+    MAX_VERIFICATION_ATTEMPTS: Max execute() failures per lemma before stopping (default: 5)
 """
 
 import os
@@ -24,6 +23,7 @@ import driver
 import sketcher
 from fine import format_errors
 from driver import prompt_begin_dafny, extract_dafny_program
+from pydantic import BaseModel
 
 from effectful.handlers.llm import Template, Tool
 from effectful.handlers.llm.completions import LiteLLMProvider, RetryLLMHandler
@@ -45,31 +45,61 @@ litellm.completion = _traced_completion
 # ---------------------------------------------------------------------------
 
 USE_SKETCHERS = os.environ.get('USE_SKETCHERS', 'true').lower() != 'false'
-MAX_ITERS = int(os.environ.get('MAX_ITERS', '3'))
 LLM_MODEL = os.environ.get('LLM_MODEL', 'vertex_ai/gemini-2.5-flash-lite')
+MAX_VERIFICATION_ATTEMPTS = int(os.environ.get('MAX_VERIFICATION_ATTEMPTS', '5'))
 
 provider = LiteLLMProvider(model=LLM_MODEL)
+
+# Per-lemma counter: failed execute() calls; reset at start of each lemma
+_execute_attempt_count = 0
 
 # ---------------------------------------------------------------------------
 # Tools – effectful wrappers around the sketcher / driver helpers
 # ---------------------------------------------------------------------------
 
+class VerificationError(Exception):
+    """Exception raised when Dafny verification fails."""
+    def __init__(self, errors: str):
+        self.errors = errors
+        super().__init__(errors)
+
+
+# DafnyTools - Tools for working with Dafny programs and proofs
+# These tools are grouped together conceptually for the LLM to discover and use
+
 @Tool.define
-def list_errors(program: str, method_name: str) -> str:
-    """Check Dafny verification errors for a specific method.
+def execute(program: str) -> str:
+    """Execute/verify a Dafny program.
+    
+    This tool verifies the entire program and raises an error if verification fails.
+    When used with RetryLLMHandler, the LLM will be retried automatically
+    when verification errors occur. After MAX_VERIFICATION_ATTEMPTS failed attempts
+    for this lemma, returns a message instead of raising so the loop stops.
 
     Args:
         program: Full Dafny program source.
-        method_name: Name of the method to verify.
 
     Returns:
-        A human-readable summary of the errors, or "No errors" when clean.
+        "Verification succeeded" if the program verifies without errors.
+        
+    Raises:
+        VerificationError: If there are verification errors (until attempt limit reached).
     """
-    print(f"[TOOL] list_errors(method_name={method_name!r})", flush=True)
-    errs = sketcher.list_errors_for_method(program, method_name)
-    if not errs:
-        return "No errors"
-    return format_errors(errs)
+    global _execute_attempt_count
+    print(f"[TOOL] execute()", flush=True)
+    errs = sketcher.list_errors_for_method(program, None)
+    if errs:
+        _execute_attempt_count += 1
+        error_msg = format_errors(errs)
+        if _execute_attempt_count >= MAX_VERIFICATION_ATTEMPTS:
+            print(f"[TOOL] execute() max attempts ({MAX_VERIFICATION_ATTEMPTS}) reached, stopping retries", flush=True)
+            return (
+                f"Max verification attempts ({MAX_VERIFICATION_ATTEMPTS}) reached. "
+                f"Last errors:\n{error_msg}\n\n"
+                "Return your current best proof body now: a single block starting with // BEGIN DAFNY and ending with // END DAFNY."
+            )
+        raise VerificationError(error_msg)
+    return "Verification succeeded"
 
 
 @Tool.define
@@ -132,11 +162,11 @@ The current verification errors are:
 Your goal:
 1. Use the `induction_sketch` tool to get a proof sketch if it seems useful.
 2. Use the `insert_body` tool to insert your proposed proof body.
-3. Use the `list_errors` tool to check whether the proof verifies.
-4. Iterate: if there are still errors, refine the body and try again.
-5. When the proof verifies (no errors), return ONLY the final proof body
-   (without the outer braces), starting with "// BEGIN DAFNY" and ending
-   with "// END DAFNY".
+3. Use the `execute` tool to verify the proof. If it raises an error, the system
+   will automatically retry, giving you a chance to refine your solution.
+4. Iterate: if verification fails (error is raised), refine the body and try again.
+5. When verification succeeds (execute returns successfully), return ONLY the final proof body (without the outer braces), starting with "// BEGIN DAFNY" and ending with "// END DAFNY".
+6. If execute() returns a message saying "Max verification attempts reached", return your current best proof body in the same format (// BEGIN DAFNY ... // END DAFNY).
 
 Please just provide the body of the lemma (without the outer braces),
 starting with a line "// BEGIN DAFNY", ending with a line "// END DAFNY".
@@ -179,27 +209,29 @@ def lemma1(lemma, p, stats):
         p = xp
         print('Not using sketchers!')
 
-    # Step 2: LLM repair loop mediated by effectful
-    for i in range(MAX_ITERS):
-        with handler(provider): #, handler(RetryLLMHandler()):
-            r = implement_lemma(p, name, format_errors(e))
+    # Step 2: LLM repair mediated by effectful (retries until success or MAX_VERIFICATION_ATTEMPTS)
+    global _execute_attempt_count
+    _execute_attempt_count = 0
+    with handler(provider), handler(RetryLLMHandler()):
+        r = implement_lemma(p, name, format_errors(e))
 
-        x = extract_dafny_program(r)
-        if x is None:
-            print(f"  iteration {i}: LLM did not return valid Dafny")
-            continue
+    x = extract_dafny_program(r)
+    if x is None:
+        print("LLM did not return valid Dafny")
+        stats[name] = 2
+        return
 
-        p = driver.insert_program_todo(lemma, init_p, x)
-        e = sketcher._list_errors_for_method_core(p, name)
-        if not e:
-            print("LLM repair loop works " + str(i))
-            stats[name] = 1
-            stats['proof_' + name] = x
-            return
-
-    print("all failed :(")
-    stats[name] = 2
-    stats['failed_proof_' + name] = x
+    # Verify the final result
+    p_final = driver.insert_program_todo(lemma, init_p, x)
+    e_final = sketcher._list_errors_for_method_core(p_final, name)
+    if not e_final:
+        print("LLM repair succeeded")
+        stats[name] = 1
+        stats['proof_' + name] = x
+    else:
+        print("LLM repair failed - still has errors")
+        stats[name] = 2
+        stats['failed_proof_' + name] = x
 
 
 # ---------------------------------------------------------------------------
