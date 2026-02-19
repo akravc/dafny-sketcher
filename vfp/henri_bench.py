@@ -44,7 +44,7 @@ def empty_lemma_body(lemma, program):
     return driver.insert_program_todo(lemma, program, "")
 
 
-def run_henri(problem_file_path, use_sketcher=False, timeout=300, max_turns=None, model=None, provider=None, keep_tmp=False):
+def run_henri(problem_file_path, lemmaName, use_sketcher=False, timeout=300, max_turns=None, model=None, provider=None, keep_tmp=False):
     """
     Run henri as a subprocess to solve the Dafny verification problem.
 
@@ -62,7 +62,7 @@ def run_henri(problem_file_path, use_sketcher=False, timeout=300, max_turns=None
     """
     filename = Path(problem_file_path).name
     tools_hint = " You have access to dafny_sketcher for induction sketches." if use_sketcher else ""
-    prompt = f"Make the file {filename} verify in Dafny. Only add lines; do not delete any line except whitespace. You have access to dafny_verify to check your work.{tools_hint} Verify your solution before finishing."
+    prompt = f"Make the file {filename} verify in Dafny. The lemma you are working on is {lemmaName}. Focus only on verifying this lemma. Only add lines; do not delete any line except whitespace. You have access to dafny_verify to check your work.{tools_hint} Verify your solution before finishing."
 
     # Build hooks list
     hooks = [
@@ -196,6 +196,17 @@ def lemma1(lemma, program, stats):
     # Step 1: Create problem file (solution with empty lemma body)
     problem_content = empty_lemma_body(lemma, program)
 
+    # Step 1.1: Verification check for empty lemma body
+    errors = sketcher.list_errors_for_method(problem_content, name)
+
+    if not errors:
+      print(f'  Empty lemma body verified: {name}!')
+      stats[name] = {
+          'status': 'verified_empty',
+          'proof': problem_content,
+      }
+      return 
+
     # Step 2: Ensure temp directory exists and write file there
     HENRI_TMP_DIR.mkdir(exist_ok=True)
     with tempfile.NamedTemporaryFile(
@@ -211,7 +222,7 @@ def lemma1(lemma, program, stats):
     try:
         # Step 3: Run henri
         print(f'  Running henri (USE_SKETCHERS={use_sketcher}, MAX_TURNS={max_turns}, MODEL={model}, PROVIDER={provider})...')
-        success, henri_stats, error, elapsed = run_henri(problem_file, use_sketcher=use_sketcher, max_turns=max_turns, model=model, provider=provider, keep_tmp=keep_tmp)
+        success, henri_stats, error, elapsed = run_henri(problem_file, name, use_sketcher=use_sketcher, max_turns=max_turns, model=model, provider=provider, keep_tmp=keep_tmp)
 
         if not success:
             print(f'  :( henri failed: {error}')
@@ -297,6 +308,7 @@ def print_stats(stats):
         status_counts[status] = status_counts.get(status, 0) + 1
 
     print(f'\nTotal lemmas: {len(stats)}')
+    print(f'  Verified empty:       {status_counts.get("verified_empty", 0)}')
     print(f'  Success:       {status_counts.get("success", 0)}')
     print(f'  Henri error:   {status_counts.get("henri_error", 0)}')
     print(f'  Diff invalid:  {status_counts.get("diff_invalid", 0)}')

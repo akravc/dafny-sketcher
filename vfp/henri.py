@@ -30,9 +30,9 @@ class DafnySketcherTool(Tool):
   - todo: List unimplemented functions/lemmas (JSON)
   - done: List implemented units (JSON)
   - todo_lemmas: List lemmas with errors (JSON)
-  - induction_search: Generate induction proof sketch for a method (requires --method)
-  - counterexamples: Find counterexamples for a method (requires --method)
-  - proof_lines: List proof lines in file or method (JSON)"""
+  - induction_search: Generate induction proof sketch for a lemma (requires lemma name to be passed to --method)
+  - counterexamples: Find counterexamples for a lemma (requires lemma name to be passed to --method)
+  - proof_lines: List proof lines in file or lemma (JSON)"""
 
     parameters = {
         "type": "object",
