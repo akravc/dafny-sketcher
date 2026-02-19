@@ -19,15 +19,26 @@ Environment variables:
 import os
 from typing import Optional
 
+# Workaround: llm.py has a bug when API keys are set (NameError on 'model').
+# bench_effectful uses effectful's LiteLLMProvider, not llm.py, so temporarily unset
+# all llm-related keys to avoid the bug during driver import.
+_LLM_KEYS = (
+    'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY',
+    'AWS_BEARER_TOKEN_BEDROCK', 'PROJECT_ID', 'OLLAMA_API_KEY', 'MLX_API_KEY',
+)
+_saved_llm_env = {k: os.environ.pop(k, None) for k in _LLM_KEYS}
 import driver
+for k, v in _saved_llm_env.items():
+    if v is not None:
+        os.environ[k] = v
 import sketcher
 from fine import format_errors
-from driver import prompt_begin_dafny, extract_dafny_program
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from effectful.handlers.llm import Template, Tool
 from effectful.handlers.llm.completions import LiteLLMProvider, RetryLLMHandler
 from effectful.ops.semantics import handler
+from effectful.ops.types import NotHandled
 
 import litellm
 _orig_completion = litellm.completion
@@ -147,8 +158,12 @@ def insert_body(lemma_name: str, original_program: str, body: str) -> str:
 # Template – the LLM-powered lemma implementer
 # ---------------------------------------------------------------------------
 
+class ThinkLemma(BaseModel):
+    think: str = Field(description="Your thoughts and plans for the lemma.")
+    code: str = Field(description="The code to insert into the lemma.")
+
 @Template.define
-def implement_lemma(program: str, lemma_name: str, errors: str) -> str:
+def implement_lemma(program: str, lemma_name: str, errors: str) -> ThinkLemma:
     """You are implementing a lemma in a Dafny program.
 
 The current program is:
@@ -168,10 +183,8 @@ Your goal:
 5. When verification succeeds (execute returns successfully), return ONLY the final proof body (without the outer braces), starting with "// BEGIN DAFNY" and ending with "// END DAFNY".
 6. If execute() returns a message saying "Max verification attempts reached", return your current best proof body in the same format (// BEGIN DAFNY ... // END DAFNY).
 
-Please just provide the body of the lemma (without the outer braces),
-starting with a line "// BEGIN DAFNY", ending with a line "// END DAFNY".
+Think, and provie your implementation of the lemma.
 """
-    from effectful.ops.types import NotHandled
     raise NotHandled
 
 
@@ -215,7 +228,7 @@ def lemma1(lemma, p, stats):
     with handler(provider), handler(RetryLLMHandler()):
         r = implement_lemma(p, name, format_errors(e))
 
-    x = extract_dafny_program(r)
+    x = r.code
     if x is None:
         print("LLM did not return valid Dafny")
         stats[name] = 2

@@ -1,0 +1,44 @@
+[project]
+name = "dafny-sketcher-vfp"
+version = "0.1.0"
+description = "VFP testbed for Dafny Sketcher - verified functional programming"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "joblib>=1.3.0",
+    "pydantic>=2.0",
+    "effectful[llm] @ git+https://github.com/BasisResearch/effectful.git@master",
+    "litellm>=1.0",
+]
+
+[project.optional-dependencies]
+# LLM providers (optional - for llm.py when not using effectful)
+anthropic = ["anthropic>=0.18"]
+openai = ["openai>=1.0"]
+google-genai = ["google-genai>=1.0"]
+# Servers and other benches
+serve = ["fastapi>=0.100", "uvicorn>=0.22"]
+annotator = ["requests>=2.28", "tqdm>=4.65"]
+# MCTS-based benches (montecarlo is local in vfp/)
+mcts = []
+# Poetry/Dafny benches (external: dafny_poetry)
+# Agenda bench (external: requires AGENDA_SYSTEM_PATH)
+all = [
+    "anthropic>=0.18",
+    "openai>=1.0",
+    "google-genai>=1.0",
+    "fastapi>=0.100",
+    "uvicorn>=0.22",
+    "requests>=2.28",
+    "tqdm>=4.65",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["vfp"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
