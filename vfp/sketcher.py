@@ -42,8 +42,17 @@ def _show_errors_for_method_core(file_input: str, method_name: str) -> Optional[
         return "Error writing temporary file"
     
     try:
-        # Run dafny verify with filter-symbol
-        cmd = ['dafny', 'verify', file_path]
+        # Run dafny verify with filter-symbol.
+        # Prefer DAFNY env var (can be a path to Dafny.dll) and fall back to `dafny`.
+        dafny_exe = os.environ.get('DAFNY')
+        if not dafny_exe:
+            local_dafny = Path(__file__).resolve().parent.parent / 'dafny' / 'Binaries' / 'Dafny.dll'
+            if local_dafny.exists():
+                dafny_exe = str(local_dafny)
+        if dafny_exe and dafny_exe.endswith('.dll'):
+            cmd = ['dotnet', dafny_exe, 'verify', file_path]
+        else:
+            cmd = [dafny_exe or 'dafny', 'verify', file_path]
         if method_name:
             cmd = cmd + ['--filter-symbol', method_name]
         
@@ -154,6 +163,23 @@ def _list_errors_for_method_core(file_input: str, method_name: Optional[str]) ->
                 # Skip lines that don't parse correctly
                 continue
     
+    # If parser found no file/line errors but verifier output still reports errors,
+    # surface a synthetic error instead of silently returning [].
+    # This catches resolution/type errors and infra failures that do not match
+    # the ".dfy(line,col): Error: ..." pattern.
+    if not result:
+        low = errors.lower()
+        if (
+            "error running dafny verify" in low
+            or "dafny verify timed out" in low
+            or "you must install or update .net" in low
+            or "z3 is not found" in low
+            or "error from dafny sketcher" in low
+            or "error:" in low
+            or "errors detected" in low
+            or "resolution/type errors detected" in low
+        ):
+            return [(1, 1, errors.strip(), "")]
     return result
 
 

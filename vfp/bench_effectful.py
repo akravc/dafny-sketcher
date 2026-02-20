@@ -16,29 +16,34 @@ Environment variables:
     MAX_VERIFICATION_ATTEMPTS: Max execute() failures per lemma before stopping (default: 5)
 """
 
+import sys
+from pathlib import Path
+
+# Use .venv at repo root first
+_repo_root = Path(__file__).resolve().parent.parent
+_venv_site = _repo_root / ".venv" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+if _venv_site.exists():
+    sys.path.insert(0, str(_venv_site))
+
 import os
+from pathlib import Path
 from typing import Optional
 
-# Workaround: llm.py has a bug when API keys are set (NameError on 'model').
-# bench_effectful uses effectful's LiteLLMProvider, not llm.py, so temporarily unset
-# all llm-related keys to avoid the bug during driver import.
-_LLM_KEYS = (
-    'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY',
-    'AWS_BEARER_TOKEN_BEDROCK', 'PROJECT_ID', 'OLLAMA_API_KEY', 'MLX_API_KEY',
-)
-_saved_llm_env = {k: os.environ.pop(k, None) for k in _LLM_KEYS}
-import driver
-for k, v in _saved_llm_env.items():
-    if v is not None:
-        os.environ[k] = v
-import sketcher
-from fine import format_errors
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+if not os.environ.get("DAFNY"):
+    _dafny_dll = Path(__file__).resolve().parent.parent / "dafny" / "Binaries" / "Dafny.dll"
+    if _dafny_dll.exists():
+        os.environ["DAFNY"] = str(_dafny_dll)
+
 from pydantic import BaseModel, Field
 
 from effectful.handlers.llm import Template, Tool
 from effectful.handlers.llm.completions import LiteLLMProvider, RetryLLMHandler
 from effectful.ops.semantics import handler
 from effectful.ops.types import NotHandled
+import driver
+import sketcher
 
 import litellm
 _orig_completion = litellm.completion
@@ -55,9 +60,18 @@ litellm.completion = _traced_completion
 # Configuration
 # ---------------------------------------------------------------------------
 
+# DUPLICATE CODE NEEDEDTO NOT DEPEND on FINE.py, which in turns, on llm.py
+# Which is buggy
+def format_errors(errs):
+    r = ""
+    for row,col,err,snippet in errs:
+        r += f"{row},{col}: {err} -- {snippet}\n"
+    return r
+
 USE_SKETCHERS = os.environ.get('USE_SKETCHERS', 'true').lower() != 'false'
 LLM_MODEL = os.environ.get('LLM_MODEL', 'vertex_ai/gemini-2.5-flash-lite')
 MAX_VERIFICATION_ATTEMPTS = int(os.environ.get('MAX_VERIFICATION_ATTEMPTS', '5'))
+FORCE_LLM = False
 
 provider = LiteLLMProvider(model=LLM_MODEL)
 
@@ -201,26 +215,29 @@ def lemma1(lemma, p, stats):
     # Step 0: try empty proof
     xp = driver.insert_program_todo(lemma, init_p, "")
     e = sketcher.list_errors_for_method(xp, name)
-    if not e:
+    if not e and not FORCE_LLM:
         print("empty proof works")
         stats[name] = -1
         return
+    if not e and FORCE_LLM:
+        print("empty proof works (continuing due to --force-llm)")
 
     # Step 1: try induction sketch (non-LLM)
     if USE_SKETCHERS:
         ix = sketcher.sketch_induction(xp, name)
         p_ind = driver.insert_program_todo(lemma, init_p, ix)
         e_ind = sketcher.list_errors_for_method(p_ind, name)
-        if not e_ind:
+        if not e_ind and not FORCE_LLM:
             print("inductive proof sketch works")
             stats[name] = 0
             return
+        if not e_ind and FORCE_LLM:
+            print("inductive proof sketch works (continuing due to --force-llm)")
         # Start LLM loop from the induction-sketched version
         p = p_ind
         e = e_ind
     else:
         p = xp
-        print('Not using sketchers!')
 
     # Step 2: LLM repair mediated by effectful (retries until success or MAX_VERIFICATION_ATTEMPTS)
     global _execute_attempt_count
@@ -275,5 +292,14 @@ def print_stats(stats):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--force-llm', action='store_true',
+                        help='Always run LLM stage even if empty/sketch proof succeeds')
+    args, remaining = parser.parse_known_args()
+    FORCE_LLM = args.force_llm
+
+    # Hand remaining args to bench_driver parser.
+    sys.argv = [sys.argv[0]] + remaining
     import bench_driver
     bench_driver.run(lemma1, print_stats)
