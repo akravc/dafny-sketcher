@@ -377,7 +377,20 @@ def sketch_done(file_input: str) -> list[object]:
         Units as JSON
     """
     result = dafny_sketcher(file_input, ['--sketch', 'done'])
-    return json.loads(result) if result else None
+    if not result:
+        return []
+    try:
+        parsed = json.loads(result)
+    except json.JSONDecodeError:
+        # Non-JSON output usually means verifier/CLI infra failure.
+        # Keep execution going, but print expected vs got for easier debugging.
+        preview = result[:500].replace("\n", "\\n")
+        print(
+            "sketch_done JSON parse failed: expected JSON list from '--sketch done', "
+            f"got: {preview}"
+        )
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 def sketch_counterexamples(file_input: str, method_name: Optional[str] = None) -> List[str]:
     """
