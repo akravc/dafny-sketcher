@@ -28,7 +28,28 @@ def main1(lemma1, f, stats, lemma_names=None):
             print('ERRORS')
             print(e)
     done = sketcher.sketch_done(p)
-    lemmas = [x for x in done if x['type'] == 'lemma']
+    lemmas = [x for x in (done or []) if isinstance(x, dict) and x.get('type') == 'lemma']
+    # Fallback for files with TODO/empty bodies where sketch_done is empty.
+    if not lemmas:
+        try:
+            todo_lemmas = sketcher.sketch_todo_lemmas(p)
+        except Exception as e:
+            print(f"todo_lemmas failed: {e}")
+            todo_lemmas = []
+        # sketch_todo_lemmas can return the sentinel string "errors" when
+        # verifier errors exist but cannot be mapped to enclosing methods.
+        if todo_lemmas == "errors":
+            try:
+                todos = sketcher.sketch_todo(p)
+            except Exception as e:
+                print(f"todo fallback failed: {e}")
+                todos = []
+            lemmas = [x for x in (todos or []) if isinstance(x, dict) and x.get('type') == 'lemma']
+        else:
+            lemmas = [x for x in (todo_lemmas or []) if isinstance(x, dict) and x.get('type') == 'lemma']
+    if not lemmas:
+        print("No lemmas discovered (done/todo_lemmas/todo all empty).")
+        return
     for lemma in lemmas:
         if not lemma_names or lemma['name'] in lemma_names:
             try:
