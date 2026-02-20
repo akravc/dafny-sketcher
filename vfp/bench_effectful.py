@@ -26,10 +26,15 @@ if _venv_site.exists():
     sys.path.insert(0, str(_venv_site))
 
 import os
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from fine import format_errors
+from typing import List
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 if not os.environ.get("DAFNY"):
     _dafny_dll = Path(__file__).resolve().parent.parent / "dafny" / "Binaries" / "Dafny.dll"
@@ -60,18 +65,15 @@ litellm.completion = _traced_completion
 # Configuration
 # ---------------------------------------------------------------------------
 
-# DUPLICATE CODE NEEDEDTO NOT DEPEND on FINE.py, which in turns, on llm.py
-# Which is buggy
-def format_errors(errs):
-    r = ""
-    for row,col,err,snippet in errs:
-        r += f"{row},{col}: {err} -- {snippet}\n"
-    return r
 
 USE_SKETCHERS = os.environ.get('USE_SKETCHERS', 'true').lower() != 'false'
 LLM_MODEL = os.environ.get('LLM_MODEL', 'vertex_ai/gemini-2.5-flash-lite')
 MAX_VERIFICATION_ATTEMPTS = int(os.environ.get('MAX_VERIFICATION_ATTEMPTS', '5'))
 FORCE_LLM = False
+DEFAULT_OUT_PATH = str(_repo_root / "vfp" / "bench_effectful_latest.json")
+DEFAULT_PERSISTENCE_OUT_PATH = str(_repo_root / "vfp" / "bench_effectful_persistence_latest.jsonl")
+OUT_PATH = DEFAULT_OUT_PATH
+PERSISTENCE_OUT_PATH = DEFAULT_PERSISTENCE_OUT_PATH
 
 provider = LiteLLMProvider(model=LLM_MODEL)
 
@@ -197,9 +199,38 @@ Your goal:
 5. When verification succeeds (execute returns successfully), return ONLY the final proof body (without the outer braces), starting with "// BEGIN DAFNY" and ending with "// END DAFNY".
 6. If execute() returns a message saying "Max verification attempts reached", return your current best proof body in the same format (// BEGIN DAFNY ... // END DAFNY).
 
-Think, and provie your implementation of the lemma.
+Think, and provie your implementation of the lemma. If you find something useful, write it to the persistence memory using the `write_to_persistence_memory` tool, and read previous runs' persistence memory using the `read_persistence_memory` tool.
 """
     raise NotHandled
+
+
+persistence_memory: List[str] = []
+
+
+def _append_persistence_event(memory: str):
+    event = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "memory": memory,
+    }
+    try:
+        with open(PERSISTENCE_OUT_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=True) + "\n")
+    except Exception as e:
+        print(f"failed to append persistence memory to {PERSISTENCE_OUT_PATH}: {e}")
+
+@Tool.define
+def read_persistence_memory() -> str:
+    """Read the persistence memory. Find things that previous run found to be useful."""
+    print("[TOOL] Reading from persistence memory: ", persistence_memory, flush=True)
+    return "\n".join(persistence_memory)
+
+@Template.define
+def write_to_persistence_memory(memory: str) -> str:
+    """Write a memory to the persistence memory, write things that are useful to remember."""
+    print("[TOOL] Writing to persistence memory: ", memory, flush=True)
+    persistence_memory.append(memory)
+    _append_persistence_event(memory)
+    return "Memory written to persistence memory"
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +265,7 @@ def lemma1(lemma, p, stats):
         if not e_ind and FORCE_LLM:
             print("inductive proof sketch works (continuing due to --force-llm)")
         # Start LLM loop from the induction-sketched version
-        p = p_ind
-        e = e_ind
+        p, e = p_ind, e_ind
     else:
         p = xp
 
@@ -279,6 +309,52 @@ def print_summary_stats(stats):
           len([v for v in stats.values() if isinstance(v, int) and v == 2]))
 
 
+def _summary_counts(stats):
+    return {
+        "empty_proof_works": len([v for v in stats.values() if isinstance(v, int) and v == -1]),
+        "inductive_proof_sketch_works": len([v for v in stats.values() if isinstance(v, int) and v == 0]),
+        "llm_repair_loop_works": len([v for v in stats.values() if isinstance(v, int) and v == 1]),
+        "unsolved": len([v for v in stats.values() if isinstance(v, int) and v == 2]),
+    }
+
+
+def save_run_state(stats):
+    payload = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "config": {
+            "llm_model": LLM_MODEL,
+            "use_sketchers": USE_SKETCHERS,
+            "max_verification_attempts": MAX_VERIFICATION_ATTEMPTS,
+            "force_llm": FORCE_LLM,
+            "persistence_out": PERSISTENCE_OUT_PATH,
+        },
+        "summary": _summary_counts(stats),
+        "persistence_memory": persistence_memory,
+        "stats": stats,
+    }
+    try:
+        with open(OUT_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=True)
+        print(f"saved run state to {OUT_PATH}")
+    except Exception as e:
+        print(f"failed to save run state to {OUT_PATH}: {e}")
+    try:
+        memory_snapshot_path = str(Path(OUT_PATH).with_suffix("")) + "_persistence.json"
+        with open(memory_snapshot_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "persistence_memory": persistence_memory,
+                },
+                f,
+                indent=2,
+                ensure_ascii=True,
+            )
+        print(f"saved persistence snapshot to {memory_snapshot_path}")
+    except Exception as e:
+        print(f"failed to save persistence snapshot: {e}")
+
+
 def print_stats(stats):
     print('FINISHED RUNNING THE BENCH')
     print(stats)
@@ -289,6 +365,7 @@ def print_stats(stats):
             print(k)
             print(v)
     print_summary_stats(stats)
+    save_run_state(stats)
 
 
 if __name__ == "__main__":
@@ -296,7 +373,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--force-llm', action='store_true',
                         help='Always run LLM stage even if empty/sketch proof succeeds')
+    parser.add_argument('--out', type=str, default=DEFAULT_OUT_PATH,
+                        help='Path to JSON file where final run state is saved')
+    parser.add_argument('--persistence-out', type=str, default=DEFAULT_PERSISTENCE_OUT_PATH,
+                        help='Path to JSONL file where persistence memory is appended during run')
     args, remaining = parser.parse_known_args()
+    OUT_PATH = args.out
+    PERSISTENCE_OUT_PATH = args.persistence_out
     FORCE_LLM = args.force_llm
 
     # Hand remaining args to bench_driver parser.
