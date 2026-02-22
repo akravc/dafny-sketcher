@@ -1,5 +1,9 @@
 import os
 from typing import List
+from effectful.handlers.llm import Template
+from effectful.handlers.llm.completions import LiteLLMProvider, RetryLLMHandler
+from effectful.ops.semantics import handler as effectful_handler
+from effectful.ops.types import NotHandled
 
 SYSTEM_PROMPT = "You are a Dafny expert." # for Anthropic only
 
@@ -15,16 +19,168 @@ DEBUG_LLM = os.environ.get('DEBUG_LLM')
 LLM_PROVIDER = os.environ.get('LLM_PROVIDER')
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', "gemini-2.5-flash")
 TEMPERATURE = float(os.environ.get('TEMPERATURE', 1.0))
+USE_EFFECTFUL_LLM = os.environ.get('USE_EFFECTFUL_LLM', '').lower() in ('true', '1', 'yes', 'on')
 
 def debug(msg: str):
     if DEBUG_LLM:
         print(f"DEBUG: {msg}")
 
+def user_text_content(prompt: str):
+    return [
+        {
+            "type": "text",
+            "text": prompt
+        }
+    ]
+
+def single_user_message(prompt: str):
+    return [
+        {
+            "role": "user",
+            "content": user_text_content(prompt)
+        }
+    ]
+
 def error_generate(*args):
     raise ValueError(f"No LLM generators are available. See llm.py for configuration options.")
 
-def dummy_generate(pkg, extra=""):
-    raise ValueError(f"Need to install pip package '{pkg}'"+extra)
+def default_claude_model() -> str:
+    # Keep historical shorthands, but normalize them to direct Anthropic names.
+    claude_model = os.environ.get('CLAUDE_MODEL')
+    if claude_model == 'opus' or claude_model == 'opus45':
+        return 'claude-opus-4-5'
+    if claude_model == 'opus41':
+        return 'claude-opus-4-1'
+    if claude_model == 'sonnet3':
+        return 'claude-3-sonnet-20240229'
+    if claude_model == 'sonnet' or claude_model == 'sonnet45':
+        return 'claude-sonnet-4-5'
+    if claude_model == 'sonnet4':
+        return 'claude-sonnet-4'
+    return os.environ.get('ANTHROPIC_MODEL', 'claude-3-7-sonnet-20250219')
+
+def default_bedrock_claude_model() -> str:
+    # Bedrock needs full Anthropic model ids.
+    model = os.environ.get('ANTHROPIC_AWS_MODEL')
+    if model:
+        return model
+    claude_model = os.environ.get('CLAUDE_MODEL', 'sonnet3')
+    if claude_model == 'opus' or claude_model == 'opus45':
+        return 'us.anthropic.claude-opus-4-5-20251101-v1:0'
+    if claude_model == 'opus41':
+        return 'us.anthropic.claude-opus-4-1-20250805-v1:0'
+    if claude_model == 'sonnet3':
+        return 'anthropic.claude-3-sonnet-20240229-v1:0'
+    if claude_model == 'sonnet' or claude_model == 'sonnet45':
+        return 'global.anthropic.claude-sonnet-4-5-20250929-v1:0'
+    if claude_model == 'sonnet4':
+        return 'global.anthropic.claude-sonnet-4-20250514-v1:0'
+    raise ValueError(f"Invalid Claude model: {claude_model}")
+
+def normalize_litellm_model(provider: str, model: str | None) -> str:
+    # If model already has an explicit provider prefix, keep it as-is.
+    if model and '/' in model:
+        return model
+    base_model = model
+    if not base_model:
+        if provider == 'openai':
+            base_model = os.environ.get('OPENAI_MODEL', 'gpt-4o')
+        elif provider == 'claude':
+            base_model = default_claude_model()
+        elif provider == 'claude_vertex':
+            base_model = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-4-5')
+        elif provider == 'claude_aws':
+            base_model = default_bedrock_claude_model()
+        elif provider == 'gemini' or provider == 'gemini_vertex':
+            base_model = GEMINI_MODEL
+        elif provider == 'ollama':
+            base_model = os.environ.get('OLLAMA_MODEL', 'gemma3:27b')
+        else:
+            base_model = os.environ.get('LLM_MODEL', 'gpt-4o')
+    # Map legacy provider keys to LiteLLM provider prefixes.
+    if provider == 'gemini_vertex' or provider == 'claude_vertex':
+        return f"vertex_ai/{base_model}"
+    if provider == 'claude_aws':
+        return f"bedrock/{base_model}"
+    if provider == 'claude':
+        return f"anthropic/{base_model}"
+    if provider == 'openai':
+        return f"openai/{base_model}"
+    if provider == 'gemini':
+        return f"gemini/{base_model}"
+    if provider == 'ollama':
+        return f"ollama/{base_model}"
+    # Heuristics for provider-agnostic "effectful"/"litellm" mode.
+    if base_model.startswith('claude'):
+        return f"anthropic/{base_model}"
+    if base_model.startswith('gemini'):
+        return f"gemini/{base_model}"
+    if base_model.startswith('gpt-'):
+        return f"openai/{base_model}"
+    if (
+        base_model.startswith('us.anthropic.')
+        or base_model.startswith('global.anthropic.')
+        or base_model.startswith('anthropic.claude-')
+    ):
+        return f"bedrock/{base_model}"
+    return base_model
+
+@Template.define
+def litellm_completion(prompt: str) -> str:
+    """You are a Dafny expert.
+    {prompt}
+    """
+    raise NotHandled
+
+def effectful_generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=None, provider='effectful'):
+    debug(f"Prompt:\n{prompt}")
+    resolved_model = normalize_litellm_model(provider, model or os.environ.get('LLM_MODEL'))
+    timeout = int(os.environ.get('LITELLM_TIMEOUT', '60'))
+    kwargs = {
+        'model': resolved_model,
+        'temperature': temperature,
+        'max_tokens': max_tokens,
+        'timeout': timeout,
+    }
+    if provider == 'ollama':
+        ollama_base = os.environ.get('OLLAMA_BASE_URL') or os.environ.get('OPENAI_BASE_URL')
+        if ollama_base:
+            kwargs['api_base'] = ollama_base
+    debug(f"Sending request to LiteLLM via effectful (provider={provider}, model={resolved_model}, max_tokens={max_tokens}, temp={temperature})")
+    with effectful_handler(LiteLLMProvider(**kwargs)), effectful_handler(RetryLLMHandler(include_traceback=False)):
+        response = litellm_completion(prompt)
+    debug("Received response from LiteLLM via effectful")
+    debug(f"Response:\n{response}")
+    return response
+
+def register_effectful_generators(overwrite_existing: bool = False) -> bool:
+    def _set_generator(alias_name: str):
+        if overwrite_existing or alias_name not in generators:
+            models[alias_name] = normalize_litellm_model(alias_name, None)
+            generators[alias_name] = (
+                lambda name: (
+                    lambda prompt, max_tokens=1000, temperature=TEMPERATURE, model=None: effectful_generate(
+                        prompt, max_tokens=max_tokens, temperature=temperature, model=model, provider=name
+                    )
+                )
+            )(alias_name)
+
+    effectful_model = normalize_litellm_model(
+        'effectful',
+        os.environ.get('LLM_MODEL') or os.environ.get('OPENAI_MODEL', 'gpt-4o')
+    )
+    if overwrite_existing or 'effectful' not in generators:
+        models['effectful'] = effectful_model
+        generators['effectful'] = lambda prompt, max_tokens=1000, temperature=TEMPERATURE, model=None: effectful_generate(
+            prompt, max_tokens=max_tokens, temperature=temperature, model=model, provider='effectful'
+        )
+    if overwrite_existing or 'litellm' not in generators:
+        models['litellm'] = effectful_model
+        generators['litellm'] = generators['effectful']
+
+    for alias in ['openai', 'claude', 'gemini', 'gemini_vertex', 'claude_vertex', 'claude_aws', 'ollama']:
+        _set_generator(alias)
+    return True
 
 models = {}
 generators = {}
@@ -35,257 +191,197 @@ def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=None):
 generators[None] = generate
 
 if AWS_BEARER_TOKEN_BEDROCK:
-    generate = None
-    try:
-        from anthropic import AnthropicBedrock
-    except ModuleNotFoundError:
-        generate = dummy_generate('anthropic[bedrock]')
-    if generate is None:
-        model = os.environ.get('ANTHROPIC_AWS_MODEL')
-        if not model:
-            claude_model = os.environ.get('CLAUDE_MODEL', 'sonnet3')
-            if claude_model == 'opus' or claude_model == 'opus45':
-                model = 'us.anthropic.claude-opus-4-5-20251101-v1:0'
-            elif claude_model == 'opus41':
-                model = 'us.anthropic.claude-opus-4-1-20250805-v1:0'
-            elif claude_model == 'sonnet3':
-                model = 'anthropic.claude-3-sonnet-20240229-v1:0'
-            elif claude_model == 'sonnet' or claude_model == 'sonnet45':
-                model = 'global.anthropic.claude-sonnet-4-5-20250929-v1:0'
-            elif claude_model == 'sonnet4':
-                model = 'global.anthropic.claude-sonnet-4-20250514-v1:0'
-            else:
-                raise ValueError(f"Invalid Claude model: {claude_model}")
-        aws_region = os.environ.get('AWS_REGION', 'us-east-1')
-        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=model):
-            debug(f"Prompt:\n{prompt}")
-            print(f"Sending request to Anthropic AWS (model={model}, max_tokens={max_tokens}, temp={temperature})")
+    # NOTE: Previously, it was checked if module is available, but the fallback was meaningless.
+    # letting the error escape now.
+    from anthropic import AnthropicBedrock
+    model = os.environ.get('ANTHROPIC_AWS_MODEL')
+    if not model:
+        claude_model = os.environ.get('CLAUDE_MODEL', 'sonnet3')
+        if claude_model == 'opus' or claude_model == 'opus45':
+            model = 'us.anthropic.claude-opus-4-5-20251101-v1:0'
+        elif claude_model == 'opus41':
+            model = 'us.anthropic.claude-opus-4-1-20250805-v1:0'
+        elif claude_model == 'sonnet3':
+            model = 'anthropic.claude-3-sonnet-20240229-v1:0'
+        elif claude_model == 'sonnet' or claude_model == 'sonnet45':
+            model = 'global.anthropic.claude-sonnet-4-5-20250929-v1:0'
+        elif claude_model == 'sonnet4':
+            model = 'global.anthropic.claude-sonnet-4-20250514-v1:0'
+        else:
+            raise ValueError(f"Invalid Claude model: {claude_model}")
+    aws_region = os.environ.get('AWS_REGION', 'us-east-1')
+    def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=model):
+        debug(f"Prompt:\n{prompt}")
+        print(f"Sending request to Anthropic AWS (model={model}, max_tokens={max_tokens}, temp={temperature})")
 
-            client = AnthropicBedrock()
+        client = AnthropicBedrock()
 
-            message = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=SYSTEM_PROMPT,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": prompt
-                            }
-                        ]
-                    }
-                ]
-            )
-            print("Received response from Anthropic AWS")
-            print(f"Response:\n{message}")
-            return message.content[0].text
-        models['claude_aws'] = model
+        message = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=SYSTEM_PROMPT,
+            messages=single_user_message(prompt)
+        )
+        print("Received response from Anthropic AWS")
+        print(f"Response:\n{message}")
+        return message.content[0].text
+    models['claude_aws'] = model
     generators['claude_aws'] = generate
 
 if PROJECT_ID:
-    generate = None
-    try:
-        from anthropic import AnthropicVertex
-    except ModuleNotFoundError:
-        generate = dummy_generate('anthropic[vertex]')
-    if generate is None:
-        model = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-4-5')
-        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=model):
-            debug(f"Prompt:\n{prompt}")
-            print(f"Sending request to Anthropic Vertex (model={model}, max_tokens={max_tokens}, temp={temperature})")
+    # NOTE: Previously, it was checked if module is available, but the fallback was meaningless.
+    # letting the error escape now.
+    from anthropic import AnthropicVertex
+    model = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-4-5')
+    def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=model):
+        debug(f"Prompt:\n{prompt}")
+        print(f"Sending request to Anthropic Vertex (model={model}, max_tokens={max_tokens}, temp={temperature})")
 
-            client = AnthropicVertex(region="us-east5", project_id=PROJECT_ID)
+        client = AnthropicVertex(region="us-east5", project_id=PROJECT_ID)
 
-            message = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=SYSTEM_PROMPT,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": prompt
-                            }
-                        ]
-                    }
-                ]
-            )
-            print("Received response from Anthropic Vertex")
-            print(f"Response:\n{message}")
-            return message.content[0].text
-        models['claude_vertex'] = model
+        message = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=SYSTEM_PROMPT,
+            messages=single_user_message(prompt)
+        )
+        print("Received response from Anthropic Vertex")
+        print(f"Response:\n{message}")
+        return message.content[0].text
+    models['claude_vertex'] = model
     generators['claude_vertex'] = generate
 
-    generate = None
-    try:
-        from google import genai
-    except ModuleNotFoundError:
-        generate = dummy_generate('google-genai')
+    # NOTE: Previously, it was checked if module is available, but the fallback was meaningless.
+    # letting the error escape now.
+    from google import genai
+    def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=GEMINI_MODEL):
+        print(f"Sending request to Gemini Vertex (model={model}, max_tokens={max_tokens}, temp={temperature})")
 
-    if generate is None:
-        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=GEMINI_MODEL):
-            print(f"Sending request to Gemini Vertex (model={model}, max_tokens={max_tokens}, temp={temperature})")
-
-            client = genai.Client(vertexai=True, project=PROJECT_ID, location="us-central1")
-            response = client.models.generate_content(
-                model=model, contents=prompt
-            )
-            text = response.text
-            print("Received response from Google Gemini")
-            print(f"Response:\n{text}")
-            return text
-        models['gemini_vertex'] = GEMINI_MODEL
+        client = genai.Client(vertexai=True, project=PROJECT_ID, location="us-central1")
+        response = client.models.generate_content(
+            model=model, contents=prompt
+        )
+        text = response.text
+        print("Received response from Google Gemini")
+        print(f"Response:\n{text}")
+        return text
+    models['gemini_vertex'] = GEMINI_MODEL
     generators['gemini_vertex'] = generate
 
 if OPENAI_API_KEY:
-    generate = None
-    try:
-        import openai
-    except ModuleNotFoundError:
-        generate = dummy_generate('openai')
-    if generate is None:
-        OPENAI_BASE_URL = os.environ.get('OPENAI_BASE_URL')
-        if OPENAI_BASE_URL:
-            openai.base_url = OPENAI_BASE_URL
-        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model="gpt-4o"):
-            debug(f"Prompt:\n{prompt}")
-            debug(f"Sending request to OpenAI (model={model}, max_tokens={max_tokens}, temp={temperature})")
+    # NOTE: Previously, it was checked if module is available, but the fallback was meaningless.
+    # letting the error escape now.
+    import openai
+    OPENAI_BASE_URL = os.environ.get('OPENAI_BASE_URL')
+    if OPENAI_BASE_URL:
+        openai.base_url = OPENAI_BASE_URL
+    def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model="gpt-4o"):
+        debug(f"Prompt:\n{prompt}")
+        debug(f"Sending request to OpenAI (model={model}, max_tokens={max_tokens}, temp={temperature})")
 
-            completion = openai.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    },
-                ],
-            )
-            response = completion.choices[0].message.content
-            debug("Received response from OpenAI")
-            debug(f"Response:\n{response}")
-            return response
-        models['openai'] = "gpt-4o"
+        completion = openai.chat.completions.create(
+            model=model,
+            messages=single_user_message(prompt),
+        )
+        response = completion.choices[0].message.content
+        debug("Received response from OpenAI")
+        debug(f"Response:\n{response}")
+        return response
+    models['openai'] = "gpt-4o"
     generators['openai'] = generate
 
 if ANTHROPIC_API_KEY:
-    generate = None
-    try:
-        import anthropic
-    except ModuleNotFoundError:
-        generate = dummy_generate('anthropic')
-    if generate is None:
-        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model="claude-3-7-sonnet-20250219"):
-            debug(f"Prompt:\n{prompt}")
-            debug(f"Sending request to Anthropic (model={model}, max_tokens={max_tokens}, temp={temperature})")
+    # NOTE: Previously, it was checked if module is available, but the fallback was meaningless.
+    # letting the error escape now.
+    import anthropic
+    def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model="claude-3-7-sonnet-20250219"):
+        debug(f"Prompt:\n{prompt}")
+        debug(f"Sending request to Anthropic (model={model}, max_tokens={max_tokens}, temp={temperature})")
 
-            client = anthropic.Anthropic()
+        client = anthropic.Anthropic()
 
-            message = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=SYSTEM_PROMPT,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": prompt
-                            }
-                        ]
-                    }
-                ]
-            )
-            debug("Received response from Anthropic")
-            debug(f"Response:\n{message}")
-            return message.content[0].text
-        models['claude'] = "claude-3-7-sonnet-20250219"
+        message = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=SYSTEM_PROMPT,
+            messages=single_user_message(prompt)
+        )
+        debug("Received response from Anthropic")
+        debug(f"Response:\n{message}")
+        return message.content[0].text
+    models['claude'] = "claude-3-7-sonnet-20250219"
     generators['claude'] = generate
 
 if GEMINI_API_KEY:
-    generate = None
-    try:
-        from google import genai
-    except ModuleNotFoundError:
-        generate = dummy_generate('google-genai')
-    if generate is None:
-        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=GEMINI_MODEL):
-            debug(f"Prompt:\n{prompt}")
-            debug(f"Sending request to Google Gemini (model={model}, max_tokens={max_tokens}, temp={temperature})")
-            
-            client = genai.Client(api_key=GEMINI_API_KEY)
+    # NOTE: Previously, it was checked if module is available, but the fallback was meaningless.
+    # letting the error escape now.
+    from google import genai
+    def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=GEMINI_MODEL):
+        debug(f"Prompt:\n{prompt}")
+        debug(f"Sending request to Google Gemini (model={model}, max_tokens={max_tokens}, temp={temperature})")
+        
+        client = genai.Client(api_key=GEMINI_API_KEY)
 
-            response = client.models.generate_content(
-                model=model, contents=prompt
-            )
-            text = response.text
-            debug("Received response from Google Gemini")
-            debug(f"Response:\n{text}")
-            return text
-        models['gemini'] = GEMINI_MODEL
+        response = client.models.generate_content(
+            model=model, contents=prompt
+        )
+        text = response.text
+        debug("Received response from Google Gemini")
+        debug(f"Response:\n{text}")
+        return text
+    models['gemini'] = GEMINI_MODEL
     generators['gemini'] = generate
 
 if OLLAMA_API_KEY:
-    generate = None
-    try:
-        import ollama
-    except ModuleNotFoundError:
-        generate = dummy_generate('ollama')
-    if generate is None:
-        model = os.environ.get('OLLAMA_MODEL', 'gemma3:27b')
-        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=model):
-            debug(f"Prompt:\n{prompt}")
-            debug(f"Sending request to Ollama (model={model}, max_tokens={max_tokens}, temp={temperature})")
+    # NOTE: Previously, it was checked if module is available, but the fallback was meaningless.
+    # letting the error escape now.
+    import ollama
+    model = os.environ.get('OLLAMA_MODEL', 'gemma3:27b')
+    def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=model):
+        debug(f"Prompt:\n{prompt}")
+        debug(f"Sending request to Ollama (model={model}, max_tokens={max_tokens}, temp={temperature})")
 
-            try:
-                response = ollama.generate(
-                    model=model, prompt=prompt,
-                    options={
-                        'max_tokens': max_tokens,
-                        'temperature': temperature
-                    }
-                )
-                debug("Received response from Ollama")
-                debug(f"Response:\n{response['response']}")
-                return response['response']
-            except Exception as e:
-                debug(f"Error generating response: {e}")
-                return None
-        models['ollama'] = model
+        try:
+            response = ollama.generate(
+                model=model, prompt=prompt,
+                options={
+                    'max_tokens': max_tokens,
+                    'temperature': temperature
+                }
+            )
+            debug("Received response from Ollama")
+            debug(f"Response:\n{response['response']}")
+            return response['response']
+        except Exception as e:
+            debug(f"Error generating response: {e}")
+            return None
+    models['ollama'] = model
     generators['ollama'] = generate
 
 if MLX_API_KEY and (len(generators) < 2 or LLM_PROVIDER == 'mlx'):
-    generate = None
-    try:
-        from mlx_lm import load
-        from mlx_lm import generate as mlx_generate
-    except ModuleNotFoundError:
-        generate = dummy_generate('mlx-lm')
-    if generate is None:
-        model_name = os.environ.get('MLX_MODEL', 'mlx-community/Qwen2.5-14B-Instruct-4bit')
-        model, tokenizer = load(model_name)
-        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=model):
+    # NOTE: Previously, it was checked if module is available, but the fallback was meaningless.
+    # letting the error escape now.
+    from mlx_lm import load
+    from mlx_lm import generate as mlx_generate
+    model_name = os.environ.get('MLX_MODEL', 'mlx-community/Qwen2.5-14B-Instruct-4bit')
+    model, tokenizer = load(model_name)
+    def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=model):
 
-            debug(f"Prompt:\n{prompt}")
-            debug(f"Sending request to MLX (model={model_name}, max_tokens={max_tokens}, temp={temperature})")
+        debug(f"Prompt:\n{prompt}")
+        debug(f"Sending request to MLX (model={model_name}, max_tokens={max_tokens}, temp={temperature})")
 
-            try:
-                response = mlx_generate(model, tokenizer, prompt=prompt)
-                debug("Received response from MLX")
-                debug(f"Response:\n{response}")
-                return response
-            except Exception as e:
-                debug(f"Error generating response: {e}")
-                return None
-        models['mlx'] = model_name
+        try:
+            response = mlx_generate(model, tokenizer, prompt=prompt)
+            debug("Received response from MLX")
+            debug(f"Response:\n{response}")
+            return response
+        except Exception as e:
+            debug(f"Error generating response: {e}")
+            return None
+    models['mlx'] = model_name
     generators['mlx'] = generate
 
 def multiline_input():
@@ -304,9 +400,28 @@ if LLM_PROVIDER=='user':
         return multiline_input()
     generators['user'] = generate
 
+effectful_requested = USE_EFFECTFUL_LLM or LLM_PROVIDER in ('effectful', 'litellm')
+has_provider = any(key is not None for key in generators.keys())
+configured_missing_or_dummy = (
+    LLM_PROVIDER is not None
+    and LLM_PROVIDER not in generators
+)
+effectful_needed_for_fallback = (
+    not has_provider
+    or configured_missing_or_dummy
+)
+if effectful_requested or effectful_needed_for_fallback:
+    registered = register_effectful_generators(overwrite_existing=effectful_requested)
+    if (effectful_requested or effectful_needed_for_fallback) and not registered:
+        print("WARNING: effectful[llm] not available, using legacy llm providers only")
+
 def pick_generate():
     if LLM_PROVIDER:
-        return LLM_PROVIDER, generators[LLM_PROVIDER]
+        if LLM_PROVIDER in generators:
+            return LLM_PROVIDER, generators[LLM_PROVIDER]
+        print(f"WARNING: LLM_PROVIDER={LLM_PROVIDER} is not configured")
+        if 'effectful' in generators:
+            return 'effectful', generators['effectful']
     gs = [(key, generators[key]) for key in generators.keys() if key is not None]
     if gs:
         return gs[0]
@@ -332,7 +447,7 @@ if CACHE_LLM:
             return generator(prompt, **filtered_kwargs)
 
         original_generate = default_generate
-        default_model = models[default_provider]
+        default_model = models.get(default_provider)
         def cached_default_generate(prompt, **kwargs):
             return cached_generate_with_config(default_provider, default_model, prompt, **kwargs)
         default_generate = cached_default_generate

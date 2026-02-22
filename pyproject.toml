@@ -19,6 +19,8 @@ dependencies = [
 anthropic = ["anthropic>=0.18"]
 openai = ["openai>=1.0"]
 google-genai = ["google-genai>=1.0"]
+ollama = ["ollama>=0.4"]
+mlx = ["mlx-lm>=0.20"]
 # Servers and other benches
 serve = ["fastapi>=0.100", "uvicorn>=0.22"]
 annotator = ["requests>=2.28", "tqdm>=4.65"]
@@ -30,6 +32,8 @@ all = [
     "anthropic>=0.18",
     "openai>=1.0",
     "google-genai>=1.0",
+    "ollama>=0.4",
+    "mlx-lm>=0.20",
     "fastapi>=0.100",
     "uvicorn>=0.22",
     "requests>=2.28",
