@@ -22,7 +22,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import Any, List, Optional
 
 import bench_driver
 import driver
@@ -65,13 +65,37 @@ MAX_VERIFICATION_ATTEMPTS = int(os.environ.get('MAX_VERIFICATION_ATTEMPTS', '5')
 FORCE_LLM = False
 DEFAULT_OUT_PATH = str(_repo_root / "vfp" / "bench_effectful_latest.json")
 DEFAULT_PERSISTENCE_OUT_PATH = str(_repo_root / "vfp" / "bench_effectful_persistence_latest.jsonl")
+DEFAULT_SAMPLES_OUT_PATH = str(_repo_root / "vfp" / "bench_effectful_samples_latest.jsonl")
 OUT_PATH = DEFAULT_OUT_PATH
 PERSISTENCE_OUT_PATH = DEFAULT_PERSISTENCE_OUT_PATH
+SAMPLES_OUT_PATH = DEFAULT_SAMPLES_OUT_PATH
 
 provider = LiteLLMProvider(model=LLM_MODEL)
 
 # Per-lemma counter: failed execute() calls; reset at start of each lemma
 _execute_attempt_count = 0
+
+# Per-lemma sampling state used to write per-iteration traces.
+_current_lemma_name: Optional[str] = None
+_current_sample_index = 0
+_current_last_code: str = ""
+
+
+def _append_sample_event(event_type: str, **payload: Any) -> None:
+    event = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "event_type": event_type,
+        "lemma": _current_lemma_name,
+        "sample_index": _current_sample_index,
+        "llm_model": LLM_MODEL,
+        "persistence_memory": list(persistence_memory),
+        **payload,
+    }
+    try:
+        with open(SAMPLES_OUT_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=True) + "\n")
+    except Exception as e:
+        print(f"failed to append sample event to {SAMPLES_OUT_PATH}: {e}")
 
 # ---------------------------------------------------------------------------
 # Tools – effectful wrappers around the sketcher / driver helpers
@@ -105,12 +129,20 @@ def execute(program: str) -> str:
     Raises:
         VerificationError: If there are verification errors (until attempt limit reached).
     """
-    global _execute_attempt_count
+    global _execute_attempt_count, _current_sample_index
     print("[TOOL] execute()", flush=True)
+    _current_sample_index += 1
     errs = sketcher.list_errors_for_method(program, None)
     if errs:
         _execute_attempt_count += 1
         error_msg = format_errors(errs)
+        _append_sample_event(
+            "execute_failed",
+            execute_attempt=_execute_attempt_count,
+            code=_current_last_code,
+            program=program,
+            errors=error_msg,
+        )
         if _execute_attempt_count >= MAX_VERIFICATION_ATTEMPTS:
             print(f"[TOOL] execute() max attempts ({MAX_VERIFICATION_ATTEMPTS}) reached, stopping retries", flush=True)
             return (
@@ -119,6 +151,12 @@ def execute(program: str) -> str:
                 "Return your current best proof body now: a single block starting with // BEGIN DAFNY and ending with // END DAFNY."
             )
         raise VerificationError(error_msg)
+    _append_sample_event(
+        "execute_succeeded",
+        execute_attempt=_execute_attempt_count + 1,
+        code=_current_last_code,
+        program=program,
+    )
     return "Verification succeeded"
 
 
@@ -154,13 +192,21 @@ def insert_body(lemma_name: str, original_program: str, body: str) -> str:
         The full Dafny program with the body inserted, or an error message.
     """
     print(f"[TOOL] insert_body(lemma_name={lemma_name!r})", flush=True)
+    global _current_last_code
+    _current_last_code = body
     done = sketcher.sketch_done(original_program)
     if done is None:
-        return "Error: could not resolve program metadata"
+        out = "Error: could not resolve program metadata"
+        _append_sample_event("insert_body_error", code=body, message=out)
+        return out
     lemma = next((x for x in done if x['name'] == lemma_name), None)
     if lemma is None:
-        return f"Error: lemma '{lemma_name}' not found in program"
-    return driver.insert_program_todo(lemma, original_program, body)
+        out = f"Error: lemma '{lemma_name}' not found in program"
+        _append_sample_event("insert_body_error", code=body, message=out)
+        return out
+    program = driver.insert_program_todo(lemma, original_program, body)
+    _append_sample_event("insert_body", code=body, program=program)
+    return program
 
 
 # ---------------------------------------------------------------------------
@@ -232,8 +278,12 @@ def write_to_persistence_memory(memory: str) -> str:
 
 def lemma1(lemma, p, stats):
     """Process a single lemma using effectful tools + LLM template."""
+    global _current_lemma_name, _current_sample_index, _current_last_code
     init_p = p
     name = lemma['name']
+    _current_lemma_name = name
+    _current_sample_index = 0
+    _current_last_code = ""
     print('lemma', name)
 
     # Step 0: try empty proof
@@ -269,6 +319,8 @@ def lemma1(lemma, p, stats):
         r = implement_lemma(p, name, format_errors(e))
 
     x = r.code
+    _current_last_code = x or ""
+    _append_sample_event("llm_returned", code=_current_last_code, think=r.think)
     if x is None:
         print("LLM did not return valid Dafny")
         stats[name] = 2
@@ -281,10 +333,12 @@ def lemma1(lemma, p, stats):
         print("LLM repair succeeded")
         stats[name] = 1
         stats['proof_' + name] = x
+        _append_sample_event("lemma_solved", code=x, program=p_final)
     else:
         print("LLM repair failed - still has errors")
         stats[name] = 2
         stats['failed_proof_' + name] = x
+        _append_sample_event("lemma_unsolved", code=x, program=p_final, errors=format_errors(e_final))
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +374,7 @@ def save_run_state(stats):
             "max_verification_attempts": MAX_VERIFICATION_ATTEMPTS,
             "force_llm": FORCE_LLM,
             "persistence_out": PERSISTENCE_OUT_PATH,
+            "samples_out": SAMPLES_OUT_PATH,
         },
         "summary": _summary_counts(stats),
         "persistence_memory": persistence_memory,
@@ -363,15 +418,22 @@ def print_stats(stats):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--model', type=str, default=LLM_MODEL,
+                        help='litellm model to use (overrides LLM_MODEL env)')
     parser.add_argument('--force-llm', action='store_true',
                         help='Always run LLM stage even if empty/sketch proof succeeds')
     parser.add_argument('--out', type=str, default=DEFAULT_OUT_PATH,
                         help='Path to JSON file where final run state is saved')
     parser.add_argument('--persistence-out', type=str, default=DEFAULT_PERSISTENCE_OUT_PATH,
                         help='Path to JSONL file where persistence memory is appended during run')
+    parser.add_argument('--samples-out', type=str, default=DEFAULT_SAMPLES_OUT_PATH,
+                        help='Path to JSONL file where per-iteration samples are appended')
     args, remaining = parser.parse_known_args()
+    LLM_MODEL = args.model
+    provider = LiteLLMProvider(model=LLM_MODEL)
     OUT_PATH = args.out
     PERSISTENCE_OUT_PATH = args.persistence_out
+    SAMPLES_OUT_PATH = args.samples_out
     FORCE_LLM = args.force_llm
 
     # Hand remaining args to bench_driver parser.
