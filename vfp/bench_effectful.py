@@ -16,41 +16,34 @@ Environment variables:
     MAX_VERIFICATION_ATTEMPTS: Max execute() failures per lemma before stopping (default: 5)
 """
 
-import sys
-from pathlib import Path
-
-# Use .venv at repo root first
-_repo_root = Path(__file__).resolve().parent.parent
-_venv_site = _repo_root / ".venv" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
-if _venv_site.exists():
-    sys.path.insert(0, str(_venv_site))
-
-import os
+import argparse
 import json
+import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
-
-from dotenv import load_dotenv
-from fine import format_errors
 from typing import List
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-if not os.environ.get("DAFNY"):
-    _dafny_dll = Path(__file__).resolve().parent.parent / "dafny" / "Binaries" / "Dafny.dll"
-    if _dafny_dll.exists():
-        os.environ["DAFNY"] = str(_dafny_dll)
-
-from pydantic import BaseModel, Field
-
+import bench_driver
+import driver
+import litellm
+import sketcher
+from dotenv import load_dotenv
 from effectful.handlers.llm import Template, Tool
 from effectful.handlers.llm.completions import LiteLLMProvider, RetryLLMHandler
 from effectful.ops.semantics import handler
 from effectful.ops.types import NotHandled
-import driver
-import sketcher
+from fine import format_errors
+from pydantic import BaseModel, Field
 
-import litellm
+_repo_root = Path(__file__).resolve().parent.parent
+
+load_dotenv(_repo_root / ".env")
+if not os.environ.get("DAFNY"):
+    _dafny_dll = _repo_root / "dafny" / "Binaries" / "Dafny.dll"
+    if _dafny_dll.exists():
+        os.environ["DAFNY"] = str(_dafny_dll)
+
 _orig_completion = litellm.completion
 def _traced_completion(*args, **kwargs):
     model = kwargs.get("model", args[0] if args else "unknown")
@@ -113,7 +106,7 @@ def execute(program: str) -> str:
         VerificationError: If there are verification errors (until attempt limit reached).
     """
     global _execute_attempt_count
-    print(f"[TOOL] execute()", flush=True)
+    print("[TOOL] execute()", flush=True)
     errs = sketcher.list_errors_for_method(program, None)
     if errs:
         _execute_attempt_count += 1
@@ -369,7 +362,6 @@ def print_stats(stats):
 
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--force-llm', action='store_true',
                         help='Always run LLM stage even if empty/sketch proof succeeds')
@@ -384,5 +376,4 @@ if __name__ == "__main__":
 
     # Hand remaining args to bench_driver parser.
     sys.argv = [sys.argv[0]] + remaining
-    import bench_driver
     bench_driver.run(lemma1, print_stats)
