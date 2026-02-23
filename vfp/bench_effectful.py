@@ -8,11 +8,12 @@ Usage:
     python bench_effectful.py
     python bench_effectful.py --file bench/binary_search_solution.dfy
     python bench_effectful.py --file bench/reverse_solution.dfy --lemma reverseLength
+    python bench_effectful.py --model openai/gpt-5
     USE_SKETCHERS=true python bench_effectful.py
 
 Environment variables:
     USE_SKETCHERS: Set to 'false' to disable sketcher tools (default: true)
-    LLM_MODEL: litellm model string (default: from LLM_MODEL env or "gpt-4o")
+    LLM_MODEL: litellm model string (default: from LLM_MODEL env or "vertex_ai/gemini-2.5-flash-lite")
     MAX_VERIFICATION_ATTEMPTS: Max execute() failures per lemma before stopping (default: 5)
 """
 
@@ -263,7 +264,7 @@ def read_persistence_memory() -> str:
     print("[TOOL] Reading from persistence memory: ", persistence_memory, flush=True)
     return "\n".join(persistence_memory)
 
-@Template.define
+@Tool.define
 def write_to_persistence_memory(memory: str) -> str:
     """Write a memory to the persistence memory, write things that are useful to remember."""
     print("[TOOL] Writing to persistence memory: ", memory, flush=True)
