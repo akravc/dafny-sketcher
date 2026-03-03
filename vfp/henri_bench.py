@@ -62,7 +62,7 @@ def run_henri(problem_file_path, lemmaName, use_sketcher=False, timeout=300, max
     """
     filename = Path(problem_file_path).name
     tools_hint = " You have access to dafny_sketcher for induction sketches." if use_sketcher else ""
-    prompt = f"Make the file {filename} verify in Dafny. The lemma you are working on is {lemmaName}. Focus only on verifying this lemma. Only add lines; do not delete any line except whitespace. You have access to dafny_verify to check your work.{tools_hint} Verify your solution before finishing."
+    prompt = f"You are a Dafny verification expert. You are working with the following file: {filename}. The lemma you are working on is {lemmaName}. Your goal is to verify this lemma in Dafny by providing an implementation for the lemma body. Focus only on verifying this lemma. You may add lines to the file, but do not delete any line except whitespace. You have access to dafny_verify to check your work.{tools_hint} Verify your solution before finishing. Do not ask any follow-up questions, just do your best."
 
     # Build hooks list
     hooks = [
