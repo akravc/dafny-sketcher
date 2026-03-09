@@ -86,6 +86,7 @@ if not os.environ.get("DAFNY"):
 USE_SKETCHERS = os.environ.get('USE_SKETCHERS', 'true').lower() != 'false'
 CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-5')
 MAX_VERIFICATION_ATTEMPTS = int(os.environ.get('MAX_VERIFICATION_ATTEMPTS', '5'))
+MAX_DEFER_ROUNDS = int(os.environ.get('MAX_DEFER_ROUNDS', '3'))
 FORCE_LLM = False
 _run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 DEFAULT_ARTIFACTS_DIR = str(_repo_root / "vfp" / f"bench_claude_code_artifacts_{_run_id}")
@@ -106,6 +107,17 @@ _current_last_code: str = ""
 persistence_memory: list[str] = []
 _resumed_stats: dict = {}
 _current_source_file: str = ""
+
+# Reusable event loop to avoid "Event loop is closed" errors from repeated _run_async()
+_event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+def _run_async(coro):
+    """Run an async coroutine, reusing the event loop to avoid closure errors."""
+    global _event_loop
+    if _event_loop is None or _event_loop.is_closed():
+        _event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_event_loop)
+    return _event_loop.run_until_complete(coro)
 
 # ---------------------------------------------------------------------------
 # Resume / persistence helpers
@@ -327,9 +339,12 @@ async def _collect_agent_text(prompt: str, options: ClaudeCodeOptions) -> str:
                         preview = block.text[:200] + "..." if len(block.text) > 200 else block.text
                         print(f"[AGENT] {preview}", flush=True)
             elif isinstance(message, ResultMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        last_text = block.text
+                if hasattr(message, 'result') and message.result:
+                    last_text = message.result
+                elif hasattr(message, 'content'):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            last_text = block.text
     except Exception as e:
         print(f"[AGENT] Error: {type(e).__name__}: {e}", flush=True)
     return last_text
@@ -490,7 +505,7 @@ def _handle_raw_file(source_file: str, program: str, stats: dict) -> None:
                          errors=format_errors(errs))
 
     # Run the agent
-    lemma_results, final_program = asyncio.run(
+    lemma_results, final_program = _run_async(
         _run_raw_file_agent(program, source_file)
     )
 
@@ -640,7 +655,7 @@ def lemma1(lemma, p, stats):
             errors_str = f"[Retry {attempt+1}/{max_outer_retries}] Previous attempt failed.\n{errors_str}"
             print(f"[RETRY] Attempt {attempt+1}/{max_outer_retries} for {name}")
 
-        x, is_axiom = asyncio.run(_run_agent(p, name, errors_str))
+        x, is_axiom = _run_async(_run_agent(p, name, errors_str))
         _current_last_code = x or ""
         _append_sample_event("llm_returned", code=_current_last_code, attempt=attempt+1)
 
@@ -782,6 +797,8 @@ if __name__ == "__main__":
                         help='Path to a previous run JSON to resume from')
     parser.add_argument('--artifacts-dir', type=str, default=DEFAULT_ARTIFACTS_DIR,
                         help='Directory to save per-lemma .dfy artifacts')
+    parser.add_argument('--max-defer-rounds', type=int, default=MAX_DEFER_ROUNDS,
+                        help='Max times unsolved lemmas are re-queued (default: 3)')
     args, remaining = parser.parse_known_args()
     CLAUDE_MODEL = args.model
     OUT_PATH = args.out
@@ -789,6 +806,7 @@ if __name__ == "__main__":
     PERSISTENCE_PATH = args.persistence_out
     ARTIFACTS_DIR = args.artifacts_dir
     FORCE_LLM = args.force_llm
+    MAX_DEFER_ROUNDS = args.max_defer_rounds
 
     # Auto-resume
     resume_path = args.resume
@@ -832,3 +850,34 @@ if __name__ == "__main__":
 
     sys.argv = [sys.argv[0]] + remaining
     bench_driver.run(lemma1, print_stats)
+
+    # --- Defer queue: re-attempt unsolved lemmas up to MAX_DEFER_ROUNDS ---
+    if MAX_DEFER_ROUNDS > 1:
+        for defer_round in range(2, MAX_DEFER_ROUNDS + 1):
+            # Reload current state to find unsolved lemmas
+            current_state = {}
+            try:
+                with open(OUT_PATH, "r", encoding="utf-8") as f:
+                    current_state = json.load(f).get("stats", {})
+            except Exception:
+                break
+
+            unsolved = [k for k, v in current_state.items()
+                        if isinstance(v, int) and v == 2
+                        and not k.startswith("proof_") and not k.startswith("failed_proof_")
+                        and not k.startswith("__raw__")]
+            if not unsolved:
+                print(f"[DEFER] No unsolved lemmas remaining after round {defer_round - 1}")
+                break
+
+            print(f"\n{'='*60}")
+            print(f"[DEFER] Round {defer_round}/{MAX_DEFER_ROUNDS}: re-attempting {len(unsolved)} unsolved lemmas")
+            print(f"[DEFER] Unsolved: {unsolved}")
+            print(f"{'='*60}\n")
+
+            # Update _resumed_stats so solved lemmas are skipped, unsolved are re-attempted
+            _resumed_stats.clear()
+            _resumed_stats.update(current_state)
+
+            # Re-run with the same args (bench_driver.run parses sys.argv again)
+            bench_driver.run(lemma1, print_stats)
