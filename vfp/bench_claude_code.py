@@ -228,20 +228,46 @@ async def query(**kwargs):
 SYSTEM_PROMPT = """You are an expert Dafny proof engineer working to prove lemmas.
 
 You have access to a Python helper at {helper_path} that provides Dafny tools.
-Run commands like:
 
-    python {helper_path} execute PROGRAM_FILE
+VERIFICATION:
+    python {helper_path} verify_method PROGRAM_FILE NAME   # verify ONLY one lemma (preferred)
+    python {helper_path} verify_slow PROGRAM_FILE NAME     # verify with 120s timeout (for complex proofs)
+    python {helper_path} execute PROGRAM_FILE              # verify full program
+
+ANALYSIS:
+    python {helper_path} detect_axiom PROGRAM_FILE NAME    # check if lemma is unprovable (bodyless functions)
+    python {helper_path} list_declarations PROGRAM_FILE    # list all declarations with [axiom]/[no-body] flags
+    python {helper_path} inspect_function PROGRAM_FILE NAME # check if opaque/axiom/has body
+
+PROOF CONSTRUCTION:
     python {helper_path} induction_sketch PROGRAM_FILE METHOD_NAME
     python {helper_path} insert_body LEMMA_NAME ORIGINAL_PROGRAM_FILE BODY_FILE
+    python {helper_path} edit_program PROGRAM_FILE SEARCH_FILE REPLACE_FILE  # surgical text replacement (avoids insert bugs)
+
+HELPER LIBRARY (reusable verified lemmas):
+    python {helper_path} list_helpers                       # see available helper lemmas
+    python {helper_path} create_helper NAME HELPER_FILE     # verify & save a helper lemma
+    python {helper_path} use_helpers PROGRAM_FILE [NAME...] # prepend helpers to program
+
+PERSISTENCE:
     python {helper_path} read_persistence
     python {helper_path} write_persistence "your insight here"
 
-Where PROGRAM_FILE / BODY_FILE are paths to temp files you write with the content.
-The execute command verifies a full Dafny program and prints errors or "Verification succeeded".
+Where PROGRAM_FILE / BODY_FILE / SEARCH_FILE / REPLACE_FILE are paths to temp files you write.
+
+KEY TIPS:
+- FIRST: Run `detect_axiom` to check if the lemma is provable. If it depends on bodyless functions, output `// AXIOM`.
+- Use `verify_method` (not `execute`) to check ONLY your lemma — avoids errors from other lemmas.
+- Use `verify_slow` for complex proofs that might time out with the default 30s.
+- Use `edit_program` instead of `insert_body` if insertion produces malformed code.
+- Use `list_helpers` / `create_helper` to build a library of reusable lemmas (e.g., mul_comm, mul_assoc).
+- Use `use_helpers` to include helper lemmas in your program before verification.
+- If a function is opaque, add `reveal FuncName();` in your proof.
 
 IMPORTANT RULES:
 - Write Dafny programs to temp files then pass the file path to the helper.
 - When you're done, output your final proof body between // BEGIN DAFNY and // END DAFNY markers.
+- If the lemma is an axiom / unprovable, output `// AXIOM` instead.
 - Do NOT use any tools other than Bash (via the helper script) and Write/Read for temp files.
 """
 
@@ -259,10 +285,13 @@ Current verification errors:
 ```
 
 Steps:
-1. Optionally call `induction_sketch` to get a proof sketch.
-2. Write your proof body, use `insert_body` to get the full program, then `execute` to verify.
-3. If verification fails, refine and retry (max {MAX_VERIFICATION_ATTEMPTS} attempts).
-4. When done (success or max attempts), output ONLY the final proof body between `// BEGIN DAFNY` and `// END DAFNY`.
+1. First, use `list_declarations` to see what lemmas/functions are available.
+2. Use `inspect_function` on any function your lemma depends on — if it's opaque, you need `reveal FuncName();`. If it's an axiom or has no body, the lemma may be unprovable.
+3. Optionally call `induction_sketch` to get a proof sketch.
+4. Write your proof body, use `insert_body` to get the full program, then `verify_method` (NOT `execute`) to check ONLY your lemma.
+5. If verification fails, refine and retry (max {MAX_VERIFICATION_ATTEMPTS} attempts).
+6. When done (success or max attempts), output ONLY the final proof body between `// BEGIN DAFNY` and `// END DAFNY`.
+7. If you determine the lemma is an axiom or unprovable (depends on uninterpreted functions), output `// AXIOM` instead.
 
 Start by reading persistence memory for any useful insights from previous lemmas."""
 
@@ -306,14 +335,22 @@ async def _collect_agent_text(prompt: str, options: ClaudeCodeOptions) -> str:
     return last_text
 
 
-async def _run_agent(program: str, lemma_name: str, errors: str) -> Optional[str]:
-    """Run Claude Code SDK agent for a single lemma. Returns the final proof body or None."""
+_AXIOM_MARKER = "// AXIOM"
+
+
+async def _run_agent(program: str, lemma_name: str, errors: str) -> tuple[Optional[str], bool]:
+    """Run Claude Code SDK agent for a single lemma.
+
+    Returns (proof_body_or_None, is_axiom).
+    """
     prompt = _build_user_prompt(program, lemma_name, errors)
     options = _make_sdk_options(SYSTEM_PROMPT, MAX_VERIFICATION_ATTEMPTS * 4 + 5)
     last_text = await _collect_agent_text(prompt, options)
     if last_text:
-        return driver.extract_dafny_program(last_text)
-    return None
+        if _AXIOM_MARKER in last_text:
+            return None, True
+        return driver.extract_dafny_program(last_text), False
+    return None, False
 
 
 # ---------------------------------------------------------------------------
@@ -324,16 +361,26 @@ RAW_FILE_SYSTEM_PROMPT = """You are an expert Dafny proof engineer.
 
 You have access to a Python helper at {helper_path} that provides Dafny tools:
 
-    python {helper_path} execute PROGRAM_FILE
+VERIFICATION:
+    python {helper_path} verify_method PROGRAM_FILE NAME   # verify ONLY one lemma (preferred)
+    python {helper_path} verify_slow PROGRAM_FILE NAME     # verify with 120s timeout
+    python {helper_path} execute PROGRAM_FILE              # verify full program
+
+ANALYSIS:
+    python {helper_path} detect_axiom PROGRAM_FILE NAME    # check if lemma is unprovable
+    python {helper_path} list_declarations PROGRAM_FILE    # list all declarations with flags
+    python {helper_path} inspect_function PROGRAM_FILE NAME
+
+PROOF CONSTRUCTION:
     python {helper_path} induction_sketch PROGRAM_FILE METHOD_NAME
     python {helper_path} insert_body LEMMA_NAME ORIGINAL_PROGRAM_FILE BODY_FILE
-    python {helper_path} read_persistence
-    python {helper_path} write_persistence "your insight here"
+    python {helper_path} edit_program PROGRAM_FILE SEARCH_FILE REPLACE_FILE
 
-Where PROGRAM_FILE / BODY_FILE are paths to temp files you write with the content.
-- execute: runs `dafny verify` and prints errors or "Verification succeeded".
-- induction_sketch: generates an induction proof sketch for a lemma (the lemma body should be empty).
-- insert_body: inserts a proof body into a lemma and returns the full program.
+HELPER LIBRARY:
+    python {helper_path} list_helpers / create_helper / use_helpers
+
+PERSISTENCE:
+    python {helper_path} read_persistence / write_persistence "insight"
 
 IMPORTANT RULES:
 - Write Dafny programs to temp files then pass the file path to the helper.
@@ -490,21 +537,67 @@ def lemma1(lemma, p, stats):
     init_p = p
     name = lemma['name']
 
-    # Resume: skip if already completed
+    # Resume: skip if already completed (but re-attempt unsolved=2)
     if name in _resumed_stats and name not in stats:
         prev = _resumed_stats[name]
-        stats[name] = prev
-        for prefix in ("proof_", "failed_proof_"):
-            key = prefix + name
-            if key in _resumed_stats:
-                stats[key] = _resumed_stats[key]
-        print(f"[RESUME] Skipping {name} (previous result: {prev})")
-        return
+        if prev != 2:  # Only skip solved/axiom, re-attempt unsolved
+            stats[name] = prev
+            for prefix in ("proof_", "failed_proof_"):
+                key = prefix + name
+                if key in _resumed_stats:
+                    stats[key] = _resumed_stats[key]
+            print(f"[RESUME] Skipping {name} (previous result: {prev})")
+            return
+        else:
+            print(f"[RETRY-UNSOLVED] Re-attempting {name} (was unsolved)")
 
     _current_lemma_name = name
     _current_sample_index = 0
     _current_last_code = ""
     print('lemma', name)
+
+    # Step -1: auto-detect axioms (bodyless functions)
+    try:
+        done = sketcher.sketch_done(init_p)
+        if done:
+            # Collect bodyless functions from sketch_done
+            import re as _re
+            bodyless_fns = [x['name'] for x in done
+                           if x.get('type') == 'function' and x.get('status') != 'done']
+            # Also scan source for standalone function declarations without bodies
+            _done_names = {x['name'] for x in done}
+            _lines = init_p.splitlines()
+            for _i, _line in enumerate(_lines):
+                _m = _re.match(r'^\s*(?:ghost\s+)?function\s+(\w+)', _line)
+                if _m and _m.group(1) not in bodyless_fns and _m.group(1) not in _done_names:
+                    _has_body = False
+                    _depth = 0
+                    for _j in range(_i, min(_i + 20, len(_lines))):
+                        for _ch in _lines[_j]:
+                            if _ch == '{': _depth += 1
+                            elif _ch == '}': _depth -= 1
+                        if _depth > 0:
+                            _has_body = True
+                            break
+                        if _j > _i and _lines[_j].strip() == '':
+                            break
+                        if _j > _i and _re.match(r'^\s*(lemma|method|function|predicate|class|module)\b', _lines[_j]):
+                            break
+                    if not _has_body:
+                        bodyless_fns.append(_m.group(1))
+            # Check lemma signature + ensures for references to bodyless functions
+            lines = init_p.splitlines()
+            start = lemma.get('startLine', 1) - 1
+            end = lemma.get('endLine', lemma.get('insertLine', start + 1))
+            lemma_sig = '\n'.join(lines[start:end])
+            referenced = [fn for fn in bodyless_fns if fn in lemma_sig]
+            if referenced:
+                print(f"[AXIOM] {name} depends on bodyless function(s): {', '.join(referenced)} — skipping")
+                stats[name] = -2
+                save_run_state(stats)
+                return
+    except Exception as e:
+        print(f"[AXIOM] Detection failed for {name}: {e}")
 
     # Step 0: try empty proof
     xp = driver.insert_program_todo(lemma, init_p, "")
@@ -533,35 +626,66 @@ def lemma1(lemma, p, stats):
     else:
         p = xp
 
-    # Step 2: Claude Code SDK agent loop
+    # Step 2: Claude Code SDK agent loop with retries
     global _execute_attempt_count
     _execute_attempt_count = 0
-    x = asyncio.run(_run_agent(p, name, format_errors(e)))
-    _current_last_code = x or ""
-    _append_sample_event("llm_returned", code=_current_last_code)
 
-    if x is None:
-        print("LLM did not return valid Dafny")
-        stats[name] = 2
-        save_run_state(stats)
-        return
+    max_outer_retries = MAX_VERIFICATION_ATTEMPTS
+    best_x = None
+    best_errors = None
 
-    # Verify the final result
-    p_final = driver.insert_program_todo(lemma, init_p, x)
-    e_final = sketcher._list_errors_for_method_core(p_final, name)
-    if not e_final:
-        print("LLM repair succeeded")
-        stats[name] = 1
-        stats['proof_' + name] = x
-        _append_sample_event("lemma_solved", code=x, program=p_final)
-        _save_artifact(name, _current_source_file, x, p_final, "solved")
-    else:
-        print("LLM repair failed - still has errors")
+    for attempt in range(max_outer_retries):
+        errors_str = format_errors(e) if e else "No errors yet"
+        if attempt > 0:
+            errors_str = f"[Retry {attempt+1}/{max_outer_retries}] Previous attempt failed.\n{errors_str}"
+            print(f"[RETRY] Attempt {attempt+1}/{max_outer_retries} for {name}")
+
+        x, is_axiom = asyncio.run(_run_agent(p, name, errors_str))
+        _current_last_code = x or ""
+        _append_sample_event("llm_returned", code=_current_last_code, attempt=attempt+1)
+
+        # Agent determined this is an axiom / unprovable
+        if is_axiom:
+            print(f"Agent identified {name} as axiom/unprovable")
+            stats[name] = -2  # special code for axiom
+            save_run_state(stats)
+            return
+
+        if x is None:
+            print(f"LLM did not return valid Dafny (attempt {attempt+1})")
+            continue
+
+        # Verify the final result
+        p_final = driver.insert_program_todo(lemma, init_p, x)
+        e_final = sketcher._list_errors_for_method_core(p_final, name)
+        if not e_final:
+            print("LLM repair succeeded")
+            stats[name] = 1
+            stats['proof_' + name] = x
+            _append_sample_event("lemma_solved", code=x, program=p_final)
+            _save_artifact(name, _current_source_file, x, p_final, "solved")
+            save_run_state(stats)
+            return
+
+        # Track best attempt (fewest errors)
+        if best_errors is None or len(e_final) < len(best_errors):
+            best_x = x
+            best_errors = e_final
+
+        # Feed errors back for next attempt
+        p, e = p_final, e_final
+
+    # All retries exhausted
+    print("LLM repair failed - still has errors after all retries")
+    x = best_x or _current_last_code
+    if x:
+        p_final = driver.insert_program_todo(lemma, init_p, x)
         stats[name] = 2
         stats['failed_proof_' + name] = x
-        _append_sample_event("lemma_unsolved", code=x, program=p_final, errors=format_errors(e_final))
+        _append_sample_event("lemma_unsolved", code=x, program=p_final, errors=format_errors(best_errors or []))
         _save_artifact(name, _current_source_file, x, p_final, "failed")
-
+    else:
+        stats[name] = 2
     save_run_state(stats)
 
 
@@ -572,6 +696,8 @@ def lemma1(lemma, p, stats):
 def print_summary_stats(stats):
     print('total for empty proof works:',
           len([v for v in stats.values() if isinstance(v, int) and v == -1]))
+    print('total for axiom/unprovable:',
+          len([v for v in stats.values() if isinstance(v, int) and v == -2]))
     print('total for inductive proof sketch works:',
           len([v for v in stats.values() if isinstance(v, int) and v == 0]))
     print('total for LLM repair loop works:',
@@ -583,6 +709,7 @@ def print_summary_stats(stats):
 def _summary_counts(stats):
     return {
         "empty_proof_works": len([v for v in stats.values() if isinstance(v, int) and v == -1]),
+        "axiom_unprovable": len([v for v in stats.values() if isinstance(v, int) and v == -2]),
         "inductive_proof_sketch_works": len([v for v in stats.values() if isinstance(v, int) and v == 0]),
         "llm_repair_loop_works": len([v for v in stats.values() if isinstance(v, int) and v == 1]),
         "unsolved": len([v for v in stats.values() if isinstance(v, int) and v == 2]),

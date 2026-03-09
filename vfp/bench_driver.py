@@ -67,8 +67,18 @@ def run(lemma1, print_stats, only_lemmas=None, on_track=False):
     parser.add_argument('--on-track', action='store_true', help='Only run on track lemmas (for default glob pattern)')
     parser.add_argument('--for-poetry', action='store_true', help='Only run on the lemmas suitable for poetry')
     parser.add_argument('--glob-pattern', type=str, help='Glob pattern for solution files (default: "bench/*_solution.dfy")')
-    
+    parser.add_argument('--files-list', type=str, help='Path to a text file with one .dfy file path per line')
+
     args = parser.parse_args()
+
+    # Load file list from text file
+    if args.files_list:
+        with open(args.files_list) as fp:
+            extra = [line.strip() for line in fp if line.strip() and not line.startswith('#')]
+        if args.file:
+            args.file.extend(extra)
+        else:
+            args.file = extra
 
     if only_lemmas is None and args.glob_pattern is None and args.on_track:
         assertions_and_forall_needed = ["dedupCorrect", "maxIsCorrect"]
