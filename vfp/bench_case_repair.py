@@ -12,7 +12,8 @@ Also provides available lemma signatures as context to the LLM.
 
 import re
 import subprocess
-from llm import default_generate as generate
+import time
+from llm import default_generate as _base_generate
 import driver
 import sketcher
 import os
@@ -24,6 +25,62 @@ from bench_induction_on import (
     insert_induction_on_attribute,
     prompt_induction_on,
 )
+
+
+# ---------------------------------------------------------------------------
+# LLM call with 429 retry
+# ---------------------------------------------------------------------------
+
+_RETRY_DELAYS = [1, 5, 10]
+
+def generate(*args, **kwargs):
+    """Wrapper around the base LLM generate that retries on 429 rate-limit errors."""
+    for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+        try:
+            return _base_generate(*args, **kwargs)
+        except Exception as e:
+            if '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e):
+                print(f'LLM rate-limited (attempt {attempt}/{len(_RETRY_DELAYS)}), retrying in {delay}s...')
+                time.sleep(delay)
+            else:
+                raise
+    # Final attempt — let any exception propagate to bench_driver.py's handler
+    return _base_generate(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Sketch helpers
+# ---------------------------------------------------------------------------
+
+def _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats):
+    """Try LLM-synthesised initial proof body.
+
+    Returns ``(ix, e, succeeded)`` where *succeeded* is True when the proof
+    already verifies (caller should ``return`` immediately) and False otherwise.
+    *ix* and *e* reflect the new program state when *succeeded* is False.
+    """
+    prompt = prompt_lemma_implementer(xp, name, e, lemma_sigs)
+    r = generate(prompt)
+    x = extract_dafny_program(r)
+    if x is not None:
+        p = driver.insert_program_todo(lemma, init_p, x)
+        new_e = sketcher._list_errors_for_method_core(p, name)
+        if not new_e:
+            print('Initial LLM repair works')
+            stats[name] = 1
+            stats['proof_' + name] = x
+            return x, new_e, True
+        return x, new_e, False
+    return None, e, False
+
+
+def _is_comments_only(sketch: str) -> bool:
+    """Return True if every non-empty line in *sketch* is a comment line."""
+    for line in sketch.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith('//'):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -541,32 +598,36 @@ def lemma1(lemma, p, stats):
             print(f'LLM suggested {{:induction_on {induction_on_value}}}')
             xp = insert_induction_on_attribute(xp, lemma, induction_on_value)
         else:
-            print('No induction_on suggestion from LLM')
+            print('No induction_on suggestion from LLM; falling back to LLM initial attempt')
+            ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
+            if succeeded:
+                return
 
         ix = sketcher.sketch_induction(xp, name)
-        p = driver.insert_program_todo(lemma, init_p, ix)
-        e = sketcher.list_errors_for_method(p, name)
-        if not e:
-            print('inductive proof sketch works')
-            stats[name] = 0
-            if induction_on_value:
-                stats['induction_on_' + name] = induction_on_value
-            return
+        if _is_comments_only(ix) or (ix and ix.startswith('Error:')):
+            if ix and ix.startswith('Error:'):
+                print(f'Sketcher returned error ({ix}); falling back to LLM initial attempt')
+            else:
+                print('Sketch is comments-only; falling back to LLM initial attempt')
+            ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
+            if succeeded:
+                return
+        else:
+            p = driver.insert_program_todo(lemma, init_p, ix)
+            e = sketcher.list_errors_for_method(p, name)
+            if not e:
+                print('inductive proof sketch works')
+                stats[name] = 0
+                if induction_on_value:
+                    stats['induction_on_' + name] = induction_on_value
+                return
     else:
         # If not using sketchers, use LLM to synthesize initial attempt
         print('Not using sketchers!')
-        prompt = prompt_lemma_implementer(xp, name, e, lemma_sigs)
-        r = generate(prompt)
-        x = extract_dafny_program(r)
-        if x is None:
+        ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
+        if succeeded:
             return
-        ix = x
-        p = driver.insert_program_todo(lemma, init_p, x)
-        e = sketcher._list_errors_for_method_core(p, name)
-        if not e:
-            print('Initial LLM repair works')
-            stats[name] = 1
-            stats['proof_' + name] = x
+        if ix is None:
             return
 
     # --- Case-by-case repair --------------------------------------------------
