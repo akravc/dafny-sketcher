@@ -753,7 +753,7 @@ def save_run_state(stats):
     except Exception as e:
         print(f"failed to save run state: {e}")
     try:
-        snapshot_path = str(Path(OUT_PATH).with_suffix("")) + "_persistence.json"
+        snapshot_path = str(Path(OUT_PATH).with_suffix("")) + "_persistence_snapshot.json"
         with open(snapshot_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
