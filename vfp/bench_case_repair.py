@@ -358,16 +358,13 @@ def try_fix_case(p, lemma, init_p, current_sketch, name, case, case_errors, lemm
         return candidate_sketch
 
     # Accept if errors *within this case* decreased or stayed the same
-    body_info = find_lemma_body(candidate_p, name)
-    if body_info:
-        _, _, body_text = body_info
-        new_cases = find_top_level_cases(body_text, body_info[0])
-        for nc in new_cases:
-            if nc['header'] == case['header']:
-                new_ce = errors_in_range(candidate_errors, nc['start'], nc['end'])
-                if len(new_ce) <= len(case_errors):
-                    return candidate_sketch
-                break
+    new_cases = find_top_level_cases(candidate_sketch, lemma['insertLine'])
+    for nc in new_cases:
+        if nc['header'] == case['header']:
+            new_ce = errors_in_range(candidate_errors, nc['start'], nc['end'])
+            if len(new_ce) <= len(case_errors):
+                return candidate_sketch
+            break
     return None
 
 
@@ -388,11 +385,7 @@ def try_fix_statements(p, lemma, init_p, current_sketch, name, case, case_errors
         if not all_errors:
             return working_sketch
 
-        body_info = find_lemma_body(wp, name)
-        if body_info is None:
-            return None
-        _, _, body_text = body_info
-        cases = find_top_level_cases(body_text, body_info[0])
+        cases = find_top_level_cases(working_sketch, lemma['insertLine'])
         target = next((c for c in cases if c['header'] == case['header']), None)
         if target is None:
             return None
