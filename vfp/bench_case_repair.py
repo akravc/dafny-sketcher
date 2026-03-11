@@ -136,62 +136,6 @@ def extract_lemma_signatures(program: str) -> str:
     return '\n'.join(sigs) if sigs else '(none)'
 
 
-def find_lemma_body(program: str, name: str):
-    """
-    Locate the lemma body in *program*.
-
-    Returns ``(body_open_line, body_close_line, body_text)`` where the line
-    numbers are **1-based** and *body_text* is the content between ``{`` and
-    ``}``.  Returns ``None`` when the lemma cannot be found.
-    """
-    lines = program.splitlines()
-    lemma_idx = None
-    for i, line in enumerate(lines):
-        if re.search(rf'\blemma\b', line) and re.search(rf'\b{re.escape(name)}\b', line):
-            lemma_idx = i
-            break
-    if lemma_idx is None:
-        return None
-
-    # Skip past requires/ensures/decreases clauses before looking for the
-    # body opening brace, so that attribute braces like {:induction_on …}
-    # on the declaration line are not mistaken for the body.
-    scan_from = lemma_idx
-    for i in range(lemma_idx + 1, len(lines)):
-        stripped = lines[i].strip()
-        if stripped.startswith(('requires', 'ensures', 'decreases')):
-            scan_from = i
-        else:
-            break
-
-    depth = 0
-    body_start = body_end = None
-    for i in range(scan_from, len(lines)):
-        for j, ch in enumerate(lines[i]):
-            if ch == '{':
-                # Skip attribute braces like {:induction_on …}
-                if depth == 0 and j + 1 < len(lines[i]) and lines[i][j + 1] == ':':
-                    continue
-                if depth == 0:
-                    body_start = i
-                depth += 1
-            elif ch == '}':
-                if depth == 0:
-                    # Closing an attribute brace we skipped – ignore
-                    continue
-                depth -= 1
-                if depth == 0:
-                    body_end = i
-                    break
-        if body_end is not None:
-            break
-
-    if body_start is None or body_end is None:
-        return None
-    body_text = '\n'.join(lines[body_start + 1 : body_end])
-    return (body_start + 1, body_end + 1, body_text)
-
-
 def find_top_level_cases(body_text: str, body_open_line: int) -> list[dict]:
     """
     Parse top-level proof branches inside a lemma body.
@@ -508,11 +452,8 @@ def case_repair(lemma, init_p, sketch, name, lemma_sigs):
         if not e:
             return current_sketch
 
-        body_info = find_lemma_body(p, name)
-        if body_info is None:
-            print('  Could not find lemma body')
-            return None
-        body_open, _, body_text = body_info
+        body_text = current_sketch
+        body_open = lemma['insertLine']
         cases = find_top_level_cases(body_text, body_open)
         if not cases:
             print('  No cases found in sketch')
