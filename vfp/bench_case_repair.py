@@ -11,7 +11,9 @@ Also provides available lemma signatures as context to the LLM.
 """
 
 import re
-from llm import default_generate as generate
+import subprocess
+import time
+from llm import default_generate as _base_generate
 import driver
 import sketcher
 import os
@@ -23,6 +25,87 @@ from bench_induction_on import (
     insert_induction_on_attribute,
     prompt_induction_on,
 )
+
+
+# ---------------------------------------------------------------------------
+# LLM call with 429 retry
+# ---------------------------------------------------------------------------
+
+_RETRY_DELAYS = [1, 5, 10]
+
+def generate(*args, **kwargs):
+    """Wrapper around the base LLM generate that retries on 429 rate-limit errors."""
+    for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+        try:
+            return _base_generate(*args, **kwargs)
+        except Exception as e:
+            if '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e):
+                print(f'LLM rate-limited (attempt {attempt}/{len(_RETRY_DELAYS)}), retrying in {delay}s...')
+                time.sleep(delay)
+            else:
+                raise
+    # Final attempt — let any exception propagate to bench_driver.py's handler
+    return _base_generate(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Sketch helpers
+# ---------------------------------------------------------------------------
+
+def _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats):
+    """Try LLM-synthesised initial proof body.
+
+    Returns ``(ix, e, succeeded)`` where *succeeded* is True when the proof
+    already verifies (caller should ``return`` immediately) and False otherwise.
+    *ix* and *e* reflect the new program state when *succeeded* is False.
+    """
+    prompt = prompt_lemma_implementer(xp, name, e, lemma_sigs)
+    r = generate(prompt)
+    x = extract_dafny_program(r)
+    if x is not None:
+        p = driver.insert_program_todo(lemma, init_p, x)
+        new_e = sketcher._list_errors_for_method_core(p, name)
+        if not new_e:
+            print('Initial LLM repair works')
+            stats[name] = 1
+            stats['proof_' + name] = x
+            return x, new_e, True
+        return x, new_e, False
+    return None, e, False
+
+
+def _is_comments_only(sketch: str) -> bool:
+    """Return True if every non-empty line in *sketch* is a comment line."""
+    for line in sketch.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith('//'):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Syntax validation
+# ---------------------------------------------------------------------------
+
+def check_dafny_syntax(program_text: str) -> list[str]:
+    """Run ``dafny parse`` and return error lines (empty list if syntactically valid)."""
+    file_path = sketcher.write_content_to_temp_file(program_text)
+    if not file_path:
+        return []
+    try:
+        result = subprocess.run(
+            ['dafny', 'resolve', file_path],
+            capture_output=True, text=True, timeout=15,
+        )
+        output = (result.stdout or '') + (result.stderr or '')
+        return [ln for ln in output.splitlines() if 'Error' in ln]
+    except Exception:
+        return []
+    finally:
+        try:
+            os.unlink(file_path)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -314,9 +397,12 @@ The errors in the work-in-progress lemma are:
 # Case-level and statement-level repair
 # ---------------------------------------------------------------------------
 
-def try_fix_case(p, lemma, init_p, current_sketch, name, case, case_errors, lemma_sigs):
+def try_fix_case(p, lemma, init_p, current_sketch, name, case, case_errors, lemma_sigs,
+                 syntax_feedback=''):
     """One LLM attempt to fix the entire *case*. Returns updated sketch or ``None``."""
-    prompt = prompt_case_repair(p, name, case['text'], case_errors, lemma_sigs)
+    note = (f"Your previous generation attempt had syntax errors:\n{syntax_feedback}\n\n"
+            if syntax_feedback else '')
+    prompt = note + prompt_case_repair(p, name, case['text'], case_errors, lemma_sigs)
     r = generate(prompt)
     candidate_sketch = extract_dafny_program(r)
     if candidate_sketch is None:
@@ -324,7 +410,6 @@ def try_fix_case(p, lemma, init_p, current_sketch, name, case, case_errors, lemm
 
     candidate_p = driver.insert_program_todo(lemma, init_p, candidate_sketch)
     candidate_errors = sketcher._list_errors_for_method_core(candidate_p, name)
-
     if not candidate_errors:
         return candidate_sketch
 
@@ -342,7 +427,8 @@ def try_fix_case(p, lemma, init_p, current_sketch, name, case, case_errors, lemm
     return None
 
 
-def try_fix_statements(p, lemma, init_p, current_sketch, name, case, case_errors, lemma_sigs):
+def try_fix_statements(p, lemma, init_p, current_sketch, name, case, case_errors, lemma_sigs,
+                       syntax_feedback=''):
     """
     Iteratively fix individual failing statements inside *case*.
 
@@ -377,7 +463,10 @@ def try_fix_statements(p, lemma, init_p, current_sketch, name, case, case_errors
         stmt = wp_lines[err_line - 1].strip() if 0 < err_line <= len(wp_lines) else ''
         line_errors = [e for e in ce if e[0] == err_line]
 
-        prompt = prompt_statement_repair(wp, name, target['text'], stmt, line_errors, lemma_sigs)
+        note = (f"Your previous generation attempt had syntax errors:\n{syntax_feedback}\n\n"
+                if syntax_feedback else '')
+        syntax_feedback = ''
+        prompt = note + prompt_statement_repair(wp, name, target['text'], stmt, line_errors, lemma_sigs)
         r = generate(prompt)
         candidate = extract_dafny_program(r)
         if candidate is None:
@@ -411,6 +500,7 @@ def case_repair(lemma, init_p, sketch, name, lemma_sigs):
     Returns the repaired sketch text, or ``None`` on failure.
     """
     current_sketch = sketch
+    syntax_feedback = ''
 
     for _iteration in range(10):
         p = driver.insert_program_todo(lemma, init_p, current_sketch)
@@ -443,15 +533,29 @@ def case_repair(lemma, init_p, sketch, name, lemma_sigs):
         print(f"  Case `{case['header']}`: {len(case_errors)} error(s)")
 
         fixed = try_fix_case(p, lemma, init_p, current_sketch, name,
-                             case, case_errors, lemma_sigs)
+                             case, case_errors, lemma_sigs, syntax_feedback)
+        syntax_feedback = ''
         if fixed is not None:
+            syntax_errs = check_dafny_syntax(driver.insert_program_todo(lemma, init_p, fixed))
+            if syntax_errs:
+                syntax_feedback = '\n'.join(syntax_errs)
+                print('  -> syntax error in case fix, rejecting:')
+                print('\n'.join(f'     {ln}' for ln in syntax_errs))
+                continue
             current_sketch = fixed
             print('  -> case-level fix applied')
             continue
 
         fixed = try_fix_statements(p, lemma, init_p, current_sketch, name,
-                                   case, case_errors, lemma_sigs)
+                                   case, case_errors, lemma_sigs, syntax_feedback)
+        syntax_feedback = ''
         if fixed is not None:
+            syntax_errs = check_dafny_syntax(driver.insert_program_todo(lemma, init_p, fixed))
+            if syntax_errs:
+                syntax_feedback = '\n'.join(syntax_errs)
+                print('  -> syntax error in statement fix, rejecting:')
+                print('\n'.join(f'     {ln}' for ln in syntax_errs))
+                continue
             current_sketch = fixed
             print('  -> statement-level fix applied')
             continue
@@ -494,32 +598,36 @@ def lemma1(lemma, p, stats):
             print(f'LLM suggested {{:induction_on {induction_on_value}}}')
             xp = insert_induction_on_attribute(xp, lemma, induction_on_value)
         else:
-            print('No induction_on suggestion from LLM')
+            print('No induction_on suggestion from LLM; falling back to LLM initial attempt')
+            ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
+            if succeeded:
+                return
 
         ix = sketcher.sketch_induction(xp, name)
-        p = driver.insert_program_todo(lemma, init_p, ix)
-        e = sketcher.list_errors_for_method(p, name)
-        if not e:
-            print('inductive proof sketch works')
-            stats[name] = 0
-            if induction_on_value:
-                stats['induction_on_' + name] = induction_on_value
-            return
+        if _is_comments_only(ix) or (ix and ix.startswith('Error:')):
+            if ix and ix.startswith('Error:'):
+                print(f'Sketcher returned error ({ix}); falling back to LLM initial attempt')
+            else:
+                print('Sketch is comments-only; falling back to LLM initial attempt')
+            ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
+            if succeeded:
+                return
+        else:
+            p = driver.insert_program_todo(lemma, init_p, ix)
+            e = sketcher.list_errors_for_method(p, name)
+            if not e:
+                print('inductive proof sketch works')
+                stats[name] = 0
+                if induction_on_value:
+                    stats['induction_on_' + name] = induction_on_value
+                return
     else:
         # If not using sketchers, use LLM to synthesize initial attempt
         print('Not using sketchers!')
-        prompt = prompt_lemma_implementer(xp, name, e, lemma_sigs)
-        r = generate(prompt)
-        x = extract_dafny_program(r)
-        if x is None:
+        ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
+        if succeeded:
             return
-        ix = x
-        p = driver.insert_program_todo(lemma, init_p, x)
-        e = sketcher._list_errors_for_method_core(p, name)
-        if not e:
-            print('Initial LLM repair works')
-            stats[name] = 1
-            stats['proof_' + name] = x
+        if ix is None:
             return
 
     # --- Case-by-case repair --------------------------------------------------
@@ -534,13 +642,23 @@ def lemma1(lemma, p, stats):
 
     # --- Whole-proof fallback -------------------------------------------------
     print('Falling back to whole-proof LLM repair...')
+    syntax_feedback = ''
     for i in range(3):
-        prompt = prompt_lemma_implementer(p, name, e, lemma_sigs)
+        note = (f"Your previous generation attempt had syntax errors:\n{syntax_feedback}\n\n"
+                if syntax_feedback else '')
+        syntax_feedback = ''
+        prompt = note + prompt_lemma_implementer(p, name, e, lemma_sigs)
         r = generate(prompt)
         x = extract_dafny_program(r)
         if x is None:
             continue
-        p = driver.insert_program_todo(lemma, init_p, x)
+        candidate_p = driver.insert_program_todo(lemma, init_p, x)
+        syntax_errs = check_dafny_syntax(candidate_p)
+        if syntax_errs:
+            syntax_feedback = '\n'.join(syntax_errs)
+            print(f'  -> syntax error in candidate (whole-proof), not accepting')
+            continue
+        p = candidate_p
         e = sketcher._list_errors_for_method_core(p, name)
         if not e:
             print('LLM repair loop works ' + str(i))
