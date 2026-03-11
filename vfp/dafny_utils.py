@@ -1,3 +1,5 @@
+import re
+
 def line_col_to_offset(lines: list[str], line: int, col: int) -> int:
     return sum(len(l) for l in lines[:line - 1]) + (col - 1)
 
@@ -16,7 +18,8 @@ def insert_program_todo_helper(todo, p, x):
         after_offset = end_offset
         to_skip = ''.join(p[start_offset:end_offset])
         # Hack: because sometimes skipping to the end_offset swallows lemmas coming after
-        if 'lemma ' in to_skip:
+        # Strip line comments before checking so comment-only bodies don't trigger this
+        if 'lemma ' in re.sub(r'//[^\n]*', '', to_skip):
             after_offset = start_offset
         xp = p[:start_offset] + "{\n" + x + "\n}" + p[after_offset:]
     else:
