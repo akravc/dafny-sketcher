@@ -52,13 +52,32 @@ def generate(*args, **kwargs):
 # Sketch helpers
 # ---------------------------------------------------------------------------
 
-def _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats):
+def _unique_stats_key(name: str, stats: dict) -> str:
+    """Return a unique key derived from *name* that is not already in *stats*.
+
+    When two lemmas from different files share the same name the second (and
+    subsequent) occurrences get keys ``name__2``, ``name__3``, … so that no
+    result is silently overwritten.
+    """
+    if name not in stats:
+        return name
+    i = 2
+    while f'{name}__{i}' in stats:
+        i += 1
+    return f'{name}__{i}'
+
+
+def _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats, stats_key=None):
     """Try LLM-synthesised initial proof body.
 
     Returns ``(ix, e, succeeded)`` where *succeeded* is True when the proof
     already verifies (caller should ``return`` immediately) and False otherwise.
     *ix* and *e* reflect the new program state when *succeeded* is False.
+
+    *stats_key* is the key to use when writing to *stats*; defaults to *name*.
     """
+    if stats_key is None:
+        stats_key = name
     prompt = prompt_lemma_implementer(xp, name, e, lemma_sigs)
     r = generate(prompt)
     x = extract_dafny_program(r)
@@ -67,8 +86,8 @@ def _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats):
         new_e = sketcher._list_errors_for_method_core(p, name)
         if not new_e:
             print('Initial LLM repair works')
-            stats[name] = 1
-            stats['proof_' + name] = x
+            stats[stats_key] = 1
+            stats['proof_' + stats_key] = x
             return x, new_e, True
         return x, new_e, False
     return None, e, False
@@ -511,12 +530,17 @@ def lemma1(lemma, p, stats):
     name = lemma['name']
     print('lemma', name)
 
+    # Deduplicate stats keys when the same lemma name appears in multiple files.
+    stats_key = _unique_stats_key(name, stats)
+    if stats_key != name:
+        print(f'  Duplicate lemma name {name!r} – using stats key {stats_key!r}')
+
     x = ''
     xp = driver.insert_program_todo(lemma, init_p, x)
     e = sketcher.list_errors_for_method(xp, name)
     if not e:
         print('empty proof works')
-        stats[name] = -1
+        stats[stats_key] = -1
         return
 
     induction_on_value = None
@@ -537,7 +561,7 @@ def lemma1(lemma, p, stats):
                     print(f'Sketcher returned error ({ix}); falling back to LLM initial attempt')
                 else:
                     print('Sketch is comments-only; falling back to LLM initial attempt')
-                ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
+                ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats, stats_key)
                 if succeeded:
                     return
             else:
@@ -545,18 +569,18 @@ def lemma1(lemma, p, stats):
                 e = sketcher.list_errors_for_method(p, name)
                 if not e:
                     print('inductive proof sketch works')
-                    stats[name] = 0
-                    stats['induction_on_' + name] = induction_on_value
+                    stats[stats_key] = 0
+                    stats['induction_on_' + stats_key] = induction_on_value
                     return
         else:
             print('No induction_on suggestion from LLM; falling back to LLM initial attempt')
-            ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
+            ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats, stats_key)
             if succeeded:
                 return
     else:
         # If not using sketchers, use LLM to synthesize initial attempt
         print('Not using sketchers!')
-        ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
+        ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats, stats_key)
         if succeeded:
             return
         if ix is None:
@@ -568,8 +592,8 @@ def lemma1(lemma, p, stats):
         result = case_repair(lemma, init_p, ix, name, lemma_sigs)
         if result is not None:
             print('case-by-case repair works')
-            stats[name] = 1
-            stats['proof_' + name] = result
+            stats[stats_key] = 1
+            stats['proof_' + stats_key] = result
             return
 
     # --- Whole-proof fallback -------------------------------------------------
@@ -594,13 +618,13 @@ def lemma1(lemma, p, stats):
         e = sketcher._list_errors_for_method_core(p, name)
         if not e:
             print('LLM repair loop works ' + str(i))
-            stats[name] = 1
-            stats['proof_' + name] = x
+            stats[stats_key] = 1
+            stats['proof_' + stats_key] = x
             return
 
     print('all failed :(')
-    stats[name] = 2
-    stats['failed_proof_' + name] = x
+    stats[stats_key] = 2
+    stats['failed_proof_' + stats_key] = x
 
 
 # ---------------------------------------------------------------------------
