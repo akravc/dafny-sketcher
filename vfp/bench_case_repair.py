@@ -531,29 +531,27 @@ def lemma1(lemma, p, stats):
         if induction_on_value and induction_on_value.lower() != 'none':
             print(f'LLM suggested {{:induction_on {induction_on_value}}}')
             xp = insert_induction_on_attribute(xp, lemma, induction_on_value)
+            ix = sketcher.sketch_induction(xp, name)
+            if _is_comments_only(ix) or (ix and ix.startswith('Error:')):
+                if ix and ix.startswith('Error:'):
+                    print(f'Sketcher returned error ({ix}); falling back to LLM initial attempt')
+                else:
+                    print('Sketch is comments-only; falling back to LLM initial attempt')
+                ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
+                if succeeded:
+                    return
+            else:
+                p = driver.insert_program_todo(lemma, init_p, ix)
+                e = sketcher.list_errors_for_method(p, name)
+                if not e:
+                    print('inductive proof sketch works')
+                    stats[name] = 0
+                    stats['induction_on_' + name] = induction_on_value
+                    return
         else:
             print('No induction_on suggestion from LLM; falling back to LLM initial attempt')
             ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
             if succeeded:
-                return
-
-        ix = sketcher.sketch_induction(xp, name)
-        if _is_comments_only(ix) or (ix and ix.startswith('Error:')):
-            if ix and ix.startswith('Error:'):
-                print(f'Sketcher returned error ({ix}); falling back to LLM initial attempt')
-            else:
-                print('Sketch is comments-only; falling back to LLM initial attempt')
-            ix, e, succeeded = _llm_initial_attempt(xp, name, e, lemma_sigs, lemma, init_p, stats)
-            if succeeded:
-                return
-        else:
-            p = driver.insert_program_todo(lemma, init_p, ix)
-            e = sketcher.list_errors_for_method(p, name)
-            if not e:
-                print('inductive proof sketch works')
-                stats[name] = 0
-                if induction_on_value:
-                    stats['induction_on_' + name] = induction_on_value
                 return
     else:
         # If not using sketchers, use LLM to synthesize initial attempt
