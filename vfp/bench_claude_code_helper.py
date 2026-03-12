@@ -28,6 +28,9 @@ import sketcher
 import driver
 from fine import format_errors
 
+# Suppress debug output when used as CLI tool
+driver.XP_DEBUG = False
+
 PERSISTENCE_PATH = os.environ.get(
     "BENCH_PERSISTENCE_PATH",
     str(_repo_root / "vfp" / "bench_claude_code_persistence_latest.jsonl"),
@@ -425,16 +428,315 @@ def cmd_use_helpers(args):
         print(program)
 
 
+def cmd_verify_isolated(args):
+    """Verify a single lemma in isolation by stubbing all other lemma bodies with 'assume false;'."""
+    if len(args) < 2:
+        print("Usage: verify_isolated PROGRAM_FILE LEMMA_NAME", file=sys.stderr)
+        sys.exit(1)
+    program = read_file(args[0])
+    target_name = args[1]
+
+    done = sketcher.sketch_done(program)
+    if not done:
+        # Fallback: just use verify_method
+        errs = sketcher.list_errors_for_method(program, target_name)
+        if errs:
+            print(f"Verification failed for {target_name}:\n{format_errors(errs)}")
+        else:
+            print(f"Verification succeeded for {target_name}")
+        return
+
+    # Stub all other lemma bodies with 'assume false;'
+    lines = program.splitlines(keepends=True)
+    # Process in reverse order to preserve line numbers
+    for item in sorted(done, key=lambda x: x.get('startLine', 0), reverse=True):
+        if item.get('name') == target_name:
+            continue  # Don't stub the target
+        if item.get('type') != 'lemma' or item.get('status') != 'done':
+            continue  # Only stub lemmas that have bodies
+        start = item.get('insertLine', 0)
+        end = item.get('endLine', 0)
+        if start <= 0 or end <= 0 or start > end:
+            continue
+        # Find the opening brace on or after insertLine
+        # Replace body content between { and } with assume false;
+        body_start = start - 1  # 0-indexed
+        body_end = end  # exclusive, 0-indexed
+        # Find first { and last }
+        joined = ''.join(lines[body_start:body_end])
+        brace_open = joined.find('{')
+        if brace_open == -1:
+            continue
+        # Replace the entire body region with a stubbed version
+        prefix = joined[:brace_open]
+        stub = prefix + "{ assume false; }\n"
+        lines[body_start:body_end] = [stub]
+
+    stubbed_program = ''.join(lines)
+    errs = sketcher.list_errors_for_method(stubbed_program, target_name)
+    if errs:
+        print(f"Verification failed for {target_name} (isolated):\n{format_errors(errs)}")
+    else:
+        print(f"Verification succeeded for {target_name} (isolated)")
+
+
+def cmd_parse_errors(args):
+    """Parse Dafny errors into structured format with categories and suggestions."""
+    if len(args) < 1:
+        print("Usage: parse_errors PROGRAM_FILE [LEMMA_NAME]", file=sys.stderr)
+        sys.exit(1)
+    program = read_file(args[0])
+    method_name = args[1] if len(args) > 1 else None
+
+    from error_parser import parse_dafny_errors, extract_proof_obligations, format_errors_structured, format_proof_obligations
+
+    # Get raw verifier output
+    raw_output = sketcher._show_errors_for_method_core(program, method_name)
+    if not raw_output:
+        print("No errors found.")
+        return
+
+    errors = parse_dafny_errors(raw_output)
+    if not errors:
+        print("Verification succeeded (no errors parsed).")
+        return
+
+    print("=== ERRORS ===")
+    print(format_errors_structured(errors))
+
+    obligations = extract_proof_obligations(errors, method_name or "")
+    if obligations:
+        print("\n=== PROOF OBLIGATIONS ===")
+        print(format_proof_obligations(obligations))
+
+
+def cmd_counterexamples(args):
+    """Get counterexamples for a lemma to understand why it fails."""
+    if len(args) < 2:
+        print("Usage: counterexamples PROGRAM_FILE LEMMA_NAME", file=sys.stderr)
+        sys.exit(1)
+    program = read_file(args[0])
+    method_name = args[1]
+    results = sketcher.sketch_counterexamples(program, method_name)
+    if isinstance(results, str):
+        print(results)
+    elif results:
+        print("Counterexamples (conditions where the lemma fails):")
+        for i, ce in enumerate(results, 1):
+            print(f"  {i}. {ce}")
+    else:
+        print("No counterexamples found (lemma may be correct).")
+
+
+def cmd_search_lemmas(args):
+    """Search for lemmas by name pattern or signature keywords in a program."""
+    if len(args) < 2:
+        print("Usage: search_lemmas PROGRAM_FILE PATTERN", file=sys.stderr)
+        sys.exit(1)
+    program = read_file(args[0])
+    pattern = args[1].lower()
+
+    import re as _re
+    results = []
+    lines = program.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if _re.match(r'^(lemma|function|predicate|ghost\s+function|ghost\s+method|method)\b', stripped):
+            # Collect full signature (may span multiple lines)
+            sig_lines = [stripped]
+            for j in range(i + 1, min(i + 10, len(lines))):
+                next_line = lines[j].strip()
+                if next_line.startswith(('requires', 'ensures', 'decreases', 'modifies', 'reads')):
+                    sig_lines.append(next_line)
+                elif next_line == '{' or next_line == '' or _re.match(r'^(lemma|function|predicate|ghost|method|class|module|datatype)\b', next_line):
+                    break
+                else:
+                    sig_lines.append(next_line)
+                    if '{' in next_line:
+                        break
+            full_sig = ' '.join(sig_lines)
+            if pattern in full_sig.lower():
+                results.append(f"  Line {i+1}: {full_sig.rstrip('{').strip()}")
+
+    if results:
+        print(f"Found {len(results)} matching declaration(s):")
+        for r in results:
+            print(r)
+    else:
+        print(f"No declarations matching '{pattern}' found.")
+
+
+def cmd_find_relevant(args):
+    """Find lemmas/functions relevant to proving a specific lemma."""
+    if len(args) < 2:
+        print("Usage: find_relevant PROGRAM_FILE LEMMA_NAME", file=sys.stderr)
+        sys.exit(1)
+    program = read_file(args[0])
+    target_name = args[1]
+    import re as _re
+
+    done = sketcher.sketch_done(program)
+    lines = program.splitlines()
+
+    # Find the target lemma's body
+    target = next((x for x in (done or []) if x.get('name') == target_name), None)
+    if not target:
+        print(f"Lemma '{target_name}' not found.")
+        return
+
+    # Get the signature + ensures region
+    start = target.get('startLine', 1) - 1
+    end = target.get('endLine', start + 1)
+    sig_region = '\n'.join(lines[start:end])
+
+    # Extract identifiers used in the signature/ensures
+    identifiers = set(_re.findall(r'\b([A-Za-z_]\w*)\b', sig_region))
+    # Remove Dafny keywords
+    keywords = {'lemma', 'function', 'method', 'predicate', 'requires', 'ensures',
+                'decreases', 'modifies', 'reads', 'returns', 'var', 'if', 'else',
+                'then', 'match', 'case', 'forall', 'exists', 'true', 'false',
+                'int', 'nat', 'bool', 'string', 'seq', 'set', 'map', 'multiset',
+                'ghost', 'opaque', 'old', 'fresh', 'allocated', 'null', 'this',
+                'assert', 'assume', 'calc', 'reveal', 'while', 'for', 'return',
+                target_name}
+    identifiers -= keywords
+
+    # Find declarations that use any of these identifiers
+    relevant = []
+    for item in (done or []):
+        name = item.get('name', '')
+        if name == target_name or name in keywords:
+            continue
+        s = item.get('startLine', 1) - 1
+        e = item.get('endLine', s + 1)
+        item_sig = '\n'.join(lines[s:e])
+        # Check if the declaration is referenced by the target
+        if name in identifiers:
+            kind = item.get('type', '?')
+            has_body = item.get('status') == 'done'
+            body_str = "has body" if has_body else "NO BODY"
+            relevant.append(f"  [{kind}] {name} ({body_str}): {item_sig.splitlines()[0].strip()}")
+
+    if relevant:
+        print(f"Declarations relevant to '{target_name}':")
+        for r in relevant:
+            print(r)
+    else:
+        print(f"No directly relevant declarations found for '{target_name}'.")
+
+
+def cmd_check_calc(args):
+    """Check each step of a calc block individually to find which step fails."""
+    if len(args) < 2:
+        print("Usage: check_calc PROGRAM_FILE LEMMA_NAME", file=sys.stderr)
+        sys.exit(1)
+    program = read_file(args[0])
+    lemma_name = args[1]
+    from calc_checker import check_calc_steps
+    print(check_calc_steps(program, lemma_name))
+
+
+def cmd_dependency_order(args):
+    """Show the optimal order to solve lemmas based on dependencies."""
+    if len(args) < 1:
+        print("Usage: dependency_order PROGRAM_FILE [LEMMA_NAME ...]", file=sys.stderr)
+        sys.exit(1)
+    program = read_file(args[0])
+    unsolved = args[1:] if len(args) > 1 else None
+    from dependency_graph import get_solve_order
+    order = get_solve_order(program, unsolved)
+    if order:
+        print("Recommended solve order:")
+        for i, name in enumerate(order, 1):
+            print(f"  {i}. {name}")
+    else:
+        print("No lemmas found to order.")
+
+
+def cmd_dependency_info(args):
+    """Show what a specific lemma depends on."""
+    if len(args) < 2:
+        print("Usage: dependency_info PROGRAM_FILE LEMMA_NAME", file=sys.stderr)
+        sys.exit(1)
+    program = read_file(args[0])
+    lemma_name = args[1]
+    from dependency_graph import format_dependency_info
+    print(format_dependency_info(program, lemma_name))
+
+
+def cmd_analyze_induction(args):
+    """Analyze induction structure: what to induct on, base/recursive cases."""
+    if len(args) < 2:
+        print("Usage: analyze_induction PROGRAM_FILE LEMMA_NAME", file=sys.stderr)
+        sys.exit(1)
+    program = read_file(args[0])
+    lemma_name = args[1]
+
+    # Get the induction sketch (which includes case analysis)
+    sketch = sketcher.sketch_induction(program, lemma_name)
+    if not sketch or "Error" in sketch:
+        # Fallback: do a shallow sketch
+        sketch = sketcher.sketch_induction(program, lemma_name, shallow=True)
+
+    done = sketcher.sketch_done(program)
+    lines = program.splitlines()
+    lemma = next((x for x in (done or []) if x.get('name') == lemma_name), None)
+
+    analysis = []
+    analysis.append(f"=== Induction Analysis for {lemma_name} ===")
+
+    if lemma:
+        start = lemma.get('startLine', 1) - 1
+        insert = lemma.get('insertLine', start + 1)
+        sig = '\n'.join(lines[start:insert])
+        analysis.append(f"\nSignature:\n{sig}")
+
+        # Extract parameters
+        import re as _re
+        params = _re.findall(r'(\w+)\s*:\s*(\w[\w<>,._ ]*)', sig)
+        if params:
+            analysis.append(f"\nParameters: {', '.join(f'{n}: {t}' for n, t in params)}")
+
+            # Identify recursive/algebraic types that are good induction candidates
+            # Look for datatype definitions in the program
+            datatypes = set()
+            for line in lines:
+                dm = _re.match(r'^\s*datatype\s+(\w+)', line)
+                if dm:
+                    datatypes.add(dm.group(1))
+
+            induction_candidates = [(n, t) for n, t in params
+                                    if t in datatypes or t in ('nat', 'Nat')]
+            if induction_candidates:
+                analysis.append(f"Induction candidates: {', '.join(f'{n} ({t})' for n, t in induction_candidates)}")
+
+    if sketch:
+        analysis.append(f"\nInduction sketch from sketcher:\n{sketch}")
+    else:
+        analysis.append("\nNo induction sketch available. Try manual case analysis.")
+
+    print('\n'.join(analysis))
+
+
 COMMANDS = {
     "execute": cmd_execute,
     "verify_method": cmd_verify_method,
     "verify_slow": cmd_verify_slow,
+    "verify_isolated": cmd_verify_isolated,
     "detect_axiom": cmd_detect_axiom,
     "list_declarations": cmd_list_declarations,
     "inspect_function": cmd_inspect_function,
     "induction_sketch": cmd_induction_sketch,
     "insert_body": cmd_insert_body,
     "edit_program": cmd_edit_program,
+    "parse_errors": cmd_parse_errors,
+    "counterexamples": cmd_counterexamples,
+    "search_lemmas": cmd_search_lemmas,
+    "find_relevant": cmd_find_relevant,
+    "check_calc": cmd_check_calc,
+    "dependency_order": cmd_dependency_order,
+    "dependency_info": cmd_dependency_info,
+    "analyze_induction": cmd_analyze_induction,
     "create_helper": cmd_create_helper,
     "list_helpers": cmd_list_helpers,
     "use_helpers": cmd_use_helpers,

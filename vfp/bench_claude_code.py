@@ -243,6 +243,7 @@ You have access to a Python helper at {helper_path} that provides Dafny tools.
 
 VERIFICATION:
     python {helper_path} verify_method PROGRAM_FILE NAME   # verify ONLY one lemma (preferred)
+    python {helper_path} verify_isolated PROGRAM_FILE NAME # verify lemma in isolation (stubs other lemmas)
     python {helper_path} verify_slow PROGRAM_FILE NAME     # verify with 120s timeout (for complex proofs)
     python {helper_path} execute PROGRAM_FILE              # verify full program
 
@@ -250,11 +251,23 @@ ANALYSIS:
     python {helper_path} detect_axiom PROGRAM_FILE NAME    # check if lemma is unprovable (bodyless functions)
     python {helper_path} list_declarations PROGRAM_FILE    # list all declarations with [axiom]/[no-body] flags
     python {helper_path} inspect_function PROGRAM_FILE NAME # check if opaque/axiom/has body
+    python {helper_path} parse_errors PROGRAM_FILE [NAME]  # structured errors with categories & suggestions
+    python {helper_path} counterexamples PROGRAM_FILE NAME # get counterexamples showing why lemma fails
+    python {helper_path} find_relevant PROGRAM_FILE NAME   # find declarations relevant to a lemma
+    python {helper_path} search_lemmas PROGRAM_FILE PATTERN # search declarations by name/keyword
 
 PROOF CONSTRUCTION:
     python {helper_path} induction_sketch PROGRAM_FILE METHOD_NAME
+    python {helper_path} analyze_induction PROGRAM_FILE NAME # deep induction analysis with candidates
     python {helper_path} insert_body LEMMA_NAME ORIGINAL_PROGRAM_FILE BODY_FILE
-    python {helper_path} edit_program PROGRAM_FILE SEARCH_FILE REPLACE_FILE  # surgical text replacement (avoids insert bugs)
+    python {helper_path} edit_program PROGRAM_FILE SEARCH_FILE REPLACE_FILE  # surgical text replacement
+
+DEPENDENCY ANALYSIS:
+    python {helper_path} dependency_order PROGRAM_FILE [NAMES...] # optimal solve order
+    python {helper_path} dependency_info PROGRAM_FILE NAME  # show what a lemma depends on
+
+CALC BLOCKS:
+    python {helper_path} check_calc PROGRAM_FILE NAME       # check each calc step individually
 
 HELPER LIBRARY (reusable verified lemmas):
     python {helper_path} list_helpers                       # see available helper lemmas
@@ -270,10 +283,15 @@ Where PROGRAM_FILE / BODY_FILE / SEARCH_FILE / REPLACE_FILE are paths to temp fi
 KEY TIPS:
 - FIRST: Run `detect_axiom` to check if the lemma is provable. If it depends on bodyless functions, output `// AXIOM`.
 - Use `verify_method` (not `execute`) to check ONLY your lemma — avoids errors from other lemmas.
+- Use `verify_isolated` when other unproved lemmas cause cascading failures.
+- Use `parse_errors` for structured error analysis with actionable suggestions.
+- Use `counterexamples` to understand what cases make the lemma fail.
+- Use `find_relevant` to discover what functions/lemmas are available for your proof.
+- Use `analyze_induction` for deep analysis of induction structure and candidates.
+- Use `check_calc` to find exactly which step of a calc block fails.
+- Use `dependency_order` to solve lemmas in the right order (dependencies first).
 - Use `verify_slow` for complex proofs that might time out with the default 30s.
 - Use `edit_program` instead of `insert_body` if insertion produces malformed code.
-- Use `list_helpers` / `create_helper` to build a library of reusable lemmas (e.g., mul_comm, mul_assoc).
-- Use `use_helpers` to include helper lemmas in your program before verification.
 - If a function is opaque, add `reveal FuncName();` in your proof.
 
 IMPORTANT RULES:
@@ -378,6 +396,7 @@ You have access to a Python helper at {helper_path} that provides Dafny tools:
 
 VERIFICATION:
     python {helper_path} verify_method PROGRAM_FILE NAME   # verify ONLY one lemma (preferred)
+    python {helper_path} verify_isolated PROGRAM_FILE NAME # verify in isolation (stubs other lemmas)
     python {helper_path} verify_slow PROGRAM_FILE NAME     # verify with 120s timeout
     python {helper_path} execute PROGRAM_FILE              # verify full program
 
@@ -385,11 +404,21 @@ ANALYSIS:
     python {helper_path} detect_axiom PROGRAM_FILE NAME    # check if lemma is unprovable
     python {helper_path} list_declarations PROGRAM_FILE    # list all declarations with flags
     python {helper_path} inspect_function PROGRAM_FILE NAME
+    python {helper_path} parse_errors PROGRAM_FILE [NAME]  # structured errors with suggestions
+    python {helper_path} counterexamples PROGRAM_FILE NAME # get counterexamples
+    python {helper_path} find_relevant PROGRAM_FILE NAME   # find relevant declarations
+    python {helper_path} search_lemmas PROGRAM_FILE PATTERN
 
 PROOF CONSTRUCTION:
     python {helper_path} induction_sketch PROGRAM_FILE METHOD_NAME
+    python {helper_path} analyze_induction PROGRAM_FILE NAME # deep induction analysis
     python {helper_path} insert_body LEMMA_NAME ORIGINAL_PROGRAM_FILE BODY_FILE
     python {helper_path} edit_program PROGRAM_FILE SEARCH_FILE REPLACE_FILE
+    python {helper_path} check_calc PROGRAM_FILE NAME       # check calc steps individually
+
+DEPENDENCY ANALYSIS:
+    python {helper_path} dependency_order PROGRAM_FILE [NAMES...]
+    python {helper_path} dependency_info PROGRAM_FILE NAME
 
 HELPER LIBRARY:
     python {helper_path} list_helpers / create_helper / use_helpers

@@ -207,7 +207,11 @@ def insert_program_todo(todo, p, x):
         # Hack: because sometimes skipping to the end_offset swallows lemmas coming after
         if 'lemma ' in to_skip:
             after_offset = start_offset
-        xp = p[:start_offset] + "{\n" + x + "\n}" + p[after_offset:]
+        # Strip outer braces from body if present to avoid double-wrapping {{ }}
+        body = x.strip()
+        if body.startswith('{') and body.endswith('}'):
+            body = body[1:-1].strip()
+        xp = p[:start_offset] + "{\n" + body + "\n}" + p[after_offset:]
     else:
         #print('CASE TODO')
         line = todo['insertLine']
@@ -216,8 +220,12 @@ def insert_program_todo(todo, p, x):
         # Ensure the target line doesn't end with newline for clean insertion
         lines[line-1] = lines[line-1].rstrip('\n\r')
         
+        # Strip outer braces from body if present to avoid double-wrapping {{ }}
+        body = x.strip()
+        if body.startswith('{') and body.endswith('}'):
+            body = body[1:-1].strip()
         # Create insertion lines as separate array elements
-        insertion_lines = ["\n", "{\n", x + "\n", "}\n"]
+        insertion_lines = ["\n", "{\n", body + "\n", "}\n"]
         
         # Insert the new lines into the array after the target line
         lines[line:line] = insertion_lines
