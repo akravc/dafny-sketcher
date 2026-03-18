@@ -175,7 +175,7 @@ if OPENAI_API_KEY:
             debug("Received response from OpenAI")
             debug(f"Response:\n{response}")
             return response
-        models['openai'] = model
+        models['openai'] = "gpt-4o"
     generators['openai'] = generate
 
 if ANTHROPIC_API_KEY:

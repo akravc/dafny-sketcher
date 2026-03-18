@@ -535,6 +535,16 @@ STRATEGY GUIDE:
 
 
 # ---------------------------------------------------------------------------
+# Queue for unsolved lemmas (retry with accumulated persistence memory)
+# ---------------------------------------------------------------------------
+
+# Each entry: (lemma_dict, program_source, file_path)
+_unsolved_queue: List[tuple] = []
+_current_file_path: str = ""
+MAX_QUEUE_PASSES = 2
+
+
+# ---------------------------------------------------------------------------
 # Core benchmark logic
 # ---------------------------------------------------------------------------
 
@@ -644,6 +654,7 @@ def lemma1(lemma, p, stats):
         print(f"[PLAN] Plan generation/execution failed: {ex}")
         _append_sample_event("plan_error", error=str(ex))
         stats[name] = 2
+        _unsolved_queue.append((lemma, init_p, _current_file_path))
         return
 
     _current_last_code = result or ""
@@ -652,6 +663,7 @@ def lemma1(lemma, p, stats):
     if result is None or result.strip() == "":
         print("Plan returned empty result")
         stats[name] = 2
+        _unsolved_queue.append((lemma, init_p, _current_file_path))
         return
 
     if result.strip() == "AXIOM":
@@ -672,6 +684,7 @@ def lemma1(lemma, p, stats):
         print("Plan failed — proof has errors")
         stats[name] = 2
         stats['failed_proof_' + name] = x
+        _unsolved_queue.append((lemma, init_p, _current_file_path))
         _append_sample_event("lemma_unsolved", code=x, program=p_final,
                              errors=format_errors(e_final))
 
@@ -775,8 +788,11 @@ if __name__ == "__main__":
     parser.add_argument('--persistence-out', type=str, default=DEFAULT_PERSISTENCE_OUT_PATH)
     parser.add_argument('--persistence-in', type=str, default=None)
     parser.add_argument('--samples-out', type=str, default=DEFAULT_SAMPLES_OUT_PATH)
+    parser.add_argument('--max-queue-passes', type=int, default=2,
+                        help='Number of retry passes for unsolved lemmas (default: 2)')
     args, remaining = parser.parse_known_args()
     LLM_MODEL = args.model
+    MAX_QUEUE_PASSES = args.max_queue_passes
     provider = LiteLLMProvider(model=LLM_MODEL)
     OUT_PATH = args.out
     PERSISTENCE_OUT_PATH = args.persistence_out
@@ -790,4 +806,61 @@ if __name__ == "__main__":
         print(f"Loaded {len(loaded)} persistence memories from {persistence_in}")
 
     sys.argv = [sys.argv[0]] + remaining
-    bench_driver.run(lemma1, print_stats)
+
+    # Wrap lemma1 to track current file path for the queue
+    _orig_main1 = bench_driver.main1
+    def _tracking_main1(lemma_fn, f, stats, lemma_names=None):
+        global _current_file_path
+        _current_file_path = f
+        return _orig_main1(lemma_fn, f, stats, lemma_names=lemma_names)
+    bench_driver.main1 = _tracking_main1
+
+    # Capture stats from bench_driver by wrapping print_stats
+    _captured_stats = {}
+    def _capturing_print_stats(stats):
+        _captured_stats.update(stats)
+        print_stats(stats)
+
+    bench_driver.run(lemma1, _capturing_print_stats)
+
+    # Queue passes: retry unsolved lemmas with accumulated persistence memory
+    stats = _captured_stats
+    for pass_num in range(1, MAX_QUEUE_PASSES + 1):
+        if not _unsolved_queue:
+            break
+        queue_snapshot = list(_unsolved_queue)
+        _unsolved_queue.clear()
+        unsolved_count = len(queue_snapshot)
+        print(f"\n{'='*60}")
+        print(f"QUEUE PASS {pass_num}/{MAX_QUEUE_PASSES}: retrying {unsolved_count} unsolved lemmas")
+        print(f"Persistence memory: {len(persistence_memory)} entries")
+        print(f"{'='*60}\n")
+
+        for lemma_info, program, file_path in queue_snapshot:
+            name = lemma_info['name']
+            # Skip if it was solved by a different pass already
+            if stats.get(name) == 1:
+                continue
+            # Reset status so lemma1 can re-attempt
+            if name in stats:
+                del stats[name]
+            if 'failed_proof_' + name in stats:
+                del stats['failed_proof_' + name]
+            print(f"[QUEUE] Retrying {name} from {file_path} (pass {pass_num})")
+            try:
+                lemma1(lemma_info, program, stats)
+            except Exception as e:
+                print(f"[QUEUE] Error retrying {name}: {e}")
+                stats[name] = 2
+
+        save_run_state(stats)
+        solved_this_pass = unsolved_count - len(_unsolved_queue)
+        print(f"\n[QUEUE] Pass {pass_num} complete: {solved_this_pass}/{unsolved_count} solved")
+        print_summary_stats(stats)
+
+    # Final stats
+    if MAX_QUEUE_PASSES > 0 and _captured_stats:
+        print(f"\n{'='*60}")
+        print("FINAL RESULTS (after queue passes)")
+        print(f"{'='*60}")
+        print_stats(stats)

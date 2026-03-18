@@ -66,9 +66,11 @@ if not os.environ.get("DAFNY"):
 
 _orig_completion = litellm.completion
 def _traced_completion(*args, **kwargs):
+    global _llm_call_count
     model = kwargs.get("model", args[0] if args else "unknown")
-    kwargs.setdefault("timeout", 60)  # 1-minute timeout to avoid infinite hangs
+    kwargs.setdefault("timeout", 600)  # 10-minute timeout for structured output + multi-turn tool calls
     print(f"[LLM] Querying {model} ...", flush=True)
+    _llm_call_count += 1
     result = _orig_completion(*args, **kwargs)
     print(f"[LLM] Response received from {model}", flush=True)
     return result
@@ -99,6 +101,13 @@ _execute_attempt_count = 0
 _current_lemma_name: Optional[str] = None
 _current_sample_index = 0
 _current_last_code: str = ""
+
+# Per-lemma tool call counter: tool_name -> count
+_tool_calls: dict[str, int] = {}
+_llm_call_count = 0
+
+def _track_tool(tool_name: str) -> None:
+    _tool_calls[tool_name] = _tool_calls.get(tool_name, 0) + 1
 
 
 def _append_sample_event(event_type: str, **payload: Any) -> None:
@@ -151,6 +160,7 @@ def execute(dafny_program: str) -> str:
     """
     global _execute_attempt_count, _current_sample_index
     print("[TOOL] execute()", flush=True)
+    _track_tool("execute")
     _current_sample_index += 1
     errs = sketcher.list_errors_for_method(dafny_program, None)
     if errs:
@@ -192,6 +202,7 @@ def induction_sketch(dafny_program: str, method_name: str) -> str:
         The induction sketch body (Dafny code to place inside the lemma).
     """
     print(f"[TOOL] induction_sketch(method_name={method_name!r})", flush=True)
+    _track_tool("induction_sketch")
     result = sketcher.sketch_induction(dafny_program, method_name)
     return result or ""
 
@@ -212,6 +223,7 @@ def insert_body(lemma_name: str, original_dafny_program: str, body: str) -> str:
         The full Dafny program with the body inserted, or an error message.
     """
     print(f"[TOOL] insert_body(lemma_name={lemma_name!r})", flush=True)
+    _track_tool("insert_body")
     global _current_last_code
     _current_last_code = body
     done = sketcher.sketch_done(original_dafny_program)
@@ -241,6 +253,7 @@ def verify_method(dafny_program: str, method_name: str) -> str:
         Success or failure message with errors.
     """
     print(f"[TOOL] verify_method(method_name={method_name!r})", flush=True)
+    _track_tool("verify_method")
     errs = sketcher.list_errors_for_method(dafny_program, method_name)
     if errs:
         return f"Verification failed for {method_name}:\n{format_errors(errs)}"
@@ -261,6 +274,7 @@ def verify_isolated(dafny_program: str, lemma_name: str) -> str:
         Success or failure message.
     """
     print(f"[TOOL] verify_isolated(lemma_name={lemma_name!r})", flush=True)
+    _track_tool("verify_isolated")
     done = sketcher.sketch_done(dafny_program)
     if not done:
         errs = sketcher.list_errors_for_method(dafny_program, lemma_name)
@@ -307,6 +321,7 @@ def detect_axiom(dafny_program: str, lemma_name: str) -> str:
     """
     import re as _re
     print(f"[TOOL] detect_axiom(lemma_name={lemma_name!r})", flush=True)
+    _track_tool("detect_axiom")
     done = sketcher.sketch_done(dafny_program)
     if not done:
         return json.dumps({"lemma": lemma_name, "is_axiom": "unknown", "reason": "could not parse declarations"})
@@ -353,6 +368,7 @@ def parse_errors_tool(dafny_program: str, method_name: str = "") -> str:
         Structured error report with proof obligations.
     """
     print(f"[TOOL] parse_errors(method_name={method_name!r})", flush=True)
+    _track_tool("parse_errors_tool")
     raw = sketcher._show_errors_for_method_core(dafny_program, method_name or None)
     if not raw:
         return "No errors found."
@@ -380,6 +396,7 @@ def counterexamples(dafny_program: str, method_name: str) -> str:
         List of counterexample conditions, or a message if none found.
     """
     print(f"[TOOL] counterexamples(method_name={method_name!r})", flush=True)
+    _track_tool("counterexamples")
     results = sketcher.sketch_counterexamples(dafny_program, method_name)
     if isinstance(results, str):
         return results
@@ -404,6 +421,7 @@ def find_relevant(dafny_program: str, lemma_name: str) -> str:
     """
     import re as _re
     print(f"[TOOL] find_relevant(lemma_name={lemma_name!r})", flush=True)
+    _track_tool("find_relevant")
     done = sketcher.sketch_done(dafny_program)
     lines = dafny_program.splitlines()
     target = next((x for x in (done or []) if x.get('name') == lemma_name), None)
@@ -453,6 +471,7 @@ def search_lemmas(dafny_program: str, pattern: str) -> str:
     """
     import re as _re
     print(f"[TOOL] search_lemmas(pattern={pattern!r})", flush=True)
+    _track_tool("search_lemmas")
     pat = pattern.lower()
     results = []
     lines = dafny_program.splitlines()
@@ -494,6 +513,7 @@ def analyze_induction(dafny_program: str, lemma_name: str) -> str:
     """
     import re as _re
     print(f"[TOOL] analyze_induction(lemma_name={lemma_name!r})", flush=True)
+    _track_tool("analyze_induction")
 
     sketch = sketcher.sketch_induction(dafny_program, lemma_name)
     if not sketch or "Error" in sketch:
@@ -540,6 +560,7 @@ def check_calc(dafny_program: str, lemma_name: str) -> str:
         Per-step pass/fail report.
     """
     print(f"[TOOL] check_calc(lemma_name={lemma_name!r})", flush=True)
+    _track_tool("check_calc")
     from calc_checker import check_calc_steps
     return check_calc_steps(dafny_program, lemma_name)
 
@@ -557,6 +578,7 @@ def dependency_order(dafny_program: str) -> str:
         Ordered list of lemma names to solve.
     """
     print("[TOOL] dependency_order()", flush=True)
+    _track_tool("dependency_order")
     from dependency_graph import get_solve_order
     order = get_solve_order(dafny_program)
     if order:
@@ -576,6 +598,7 @@ def dependency_info(dafny_program: str, lemma_name: str) -> str:
         List of dependencies with their types and body status.
     """
     print(f"[TOOL] dependency_info(lemma_name={lemma_name!r})", flush=True)
+    _track_tool("dependency_info")
     from dependency_graph import format_dependency_info
     return format_dependency_info(dafny_program, lemma_name)
 
@@ -592,6 +615,7 @@ def inspect_function(dafny_program: str, name: str) -> str:
         JSON with properties: has_body, is_axiom, is_opaque, is_ghost, etc.
     """
     print(f"[TOOL] inspect_function(name={name!r})", flush=True)
+    _track_tool("inspect_function")
     done = sketcher.sketch_done(dafny_program)
     item = next((x for x in (done or []) if x.get('name') == name), None)
     if item is None:
@@ -632,6 +656,7 @@ def list_declarations(dafny_program: str) -> str:
     """
     import re as _re
     print("[TOOL] list_declarations()", flush=True)
+    _track_tool("list_declarations")
     done = sketcher.sketch_done(dafny_program)
     lines = dafny_program.splitlines()
     if not done:
@@ -726,12 +751,14 @@ def _append_persistence_event(memory: str):
 def read_persistence_memory() -> str:
     """Read the persistence memory. Find things that previous run found to be useful."""
     print("[TOOL] Reading from persistence memory: ", persistence_memory, flush=True)
+    _track_tool("read_persistence_memory")
     return "\n".join(persistence_memory)
 
 @Tool.define
 def write_to_persistence_memory(memory: str) -> str:
     """Write a memory to the persistence memory, write things that are useful to remember."""
     print("[TOOL] Writing to persistence memory: ", memory, flush=True)
+    _track_tool("write_to_persistence_memory")
     persistence_memory.append(memory)
     _append_persistence_event(memory)
     return "Memory written to persistence memory"
@@ -750,6 +777,8 @@ def lemma1(lemma, p, stats):
     _current_lemma_name = name
     _current_sample_index = 0
     _current_last_code = ""
+    _tool_calls.clear()
+    _llm_call_count = 0
     print('lemma', name)
 
     # Step -1: auto-detect axioms (bodyless functions)
@@ -826,7 +855,8 @@ def lemma1(lemma, p, stats):
 
     x = r.code
     _current_last_code = x or ""
-    _append_sample_event("llm_returned", code=_current_last_code, think=r.think)
+    _append_sample_event("llm_returned", code=_current_last_code, think=r.think,
+                         tool_calls=dict(_tool_calls), llm_calls=_llm_call_count)
     if x is None:
         print("LLM did not return valid Dafny")
         stats[name] = 2
@@ -839,12 +869,16 @@ def lemma1(lemma, p, stats):
         print("LLM repair succeeded")
         stats[name] = 1
         stats['proof_' + name] = x
-        _append_sample_event("lemma_solved", code=x, program=p_final)
+        stats['calls_' + name] = {"tool_calls": dict(_tool_calls), "llm_calls": _llm_call_count}
+        _append_sample_event("lemma_solved", code=x, program=p_final,
+                             tool_calls=dict(_tool_calls), llm_calls=_llm_call_count)
     else:
         print("LLM repair failed - still has errors")
         stats[name] = 2
         stats['failed_proof_' + name] = x
-        _append_sample_event("lemma_unsolved", code=x, program=p_final, errors=format_errors(e_final))
+        stats['calls_' + name] = {"tool_calls": dict(_tool_calls), "llm_calls": _llm_call_count}
+        _append_sample_event("lemma_unsolved", code=x, program=p_final, errors=format_errors(e_final),
+                             tool_calls=dict(_tool_calls), llm_calls=_llm_call_count)
 
 
 # ---------------------------------------------------------------------------

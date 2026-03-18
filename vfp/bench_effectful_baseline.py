@@ -65,9 +65,11 @@ if not os.environ.get("DAFNY"):
 
 _orig_completion = litellm.completion
 def _traced_completion(*args, **kwargs):
+    global _llm_call_count
     model = kwargs.get("model", args[0] if args else "unknown")
-    kwargs.setdefault("timeout", 60)  # 1-minute timeout to avoid infinite hangs
+    kwargs.setdefault("timeout", 600)  # 10-minute timeout
     print(f"[LLM] Querying {model} ...", flush=True)
+    _llm_call_count += 1
     result = _orig_completion(*args, **kwargs)
     print(f"[LLM] Response received from {model}", flush=True)
     return result
@@ -98,6 +100,13 @@ _execute_attempt_count = 0
 _current_lemma_name: Optional[str] = None
 _current_sample_index = 0
 _current_last_code: str = ""
+
+# Per-lemma tool call counter and LLM call counter
+_tool_calls: dict[str, int] = {}
+_llm_call_count = 0
+
+def _track_tool(tool_name: str) -> None:
+    _tool_calls[tool_name] = _tool_calls.get(tool_name, 0) + 1
 
 
 def _append_sample_event(event_type: str, **payload: Any) -> None:
@@ -150,6 +159,7 @@ def execute(dafny_program: str) -> str:
     """
     global _execute_attempt_count, _current_sample_index
     print("[TOOL] execute()", flush=True)
+    _track_tool("execute")
     _current_sample_index += 1
     errs = sketcher.list_errors_for_method(dafny_program, None)
     if errs:
@@ -191,6 +201,7 @@ def induction_sketch(dafny_program: str, method_name: str) -> str:
         The induction sketch body (Dafny code to place inside the lemma).
     """
     print(f"[TOOL] induction_sketch(method_name={method_name!r})", flush=True)
+    _track_tool("induction_sketch")
     result = sketcher.sketch_induction(dafny_program, method_name)
     return result or ""
 
@@ -211,6 +222,7 @@ def insert_body(lemma_name: str, original_dafny_program: str, body: str) -> str:
         The full Dafny program with the body inserted, or an error message.
     """
     print(f"[TOOL] insert_body(lemma_name={lemma_name!r})", flush=True)
+    _track_tool("insert_body")
     global _current_last_code
     _current_last_code = body
     done = sketcher.sketch_done(original_dafny_program)
@@ -280,12 +292,14 @@ def _append_persistence_event(memory: str):
 def read_persistence_memory() -> str:
     """Read the persistence memory. Find things that previous run found to be useful."""
     print("[TOOL] Reading from persistence memory: ", persistence_memory, flush=True)
+    _track_tool("read_persistence_memory")
     return "\n".join(persistence_memory)
 
 @Tool.define
 def write_to_persistence_memory(memory: str) -> str:
     """Write a memory to the persistence memory, write things that are useful to remember."""
     print("[TOOL] Writing to persistence memory: ", memory, flush=True)
+    _track_tool("write_to_persistence_memory")
     persistence_memory.append(memory)
     _append_persistence_event(memory)
     return "Memory written to persistence memory"
@@ -304,6 +318,8 @@ def lemma1(lemma, p, stats):
     _current_lemma_name = name
     _current_sample_index = 0
     _current_last_code = ""
+    _tool_calls.clear()
+    _llm_call_count = 0
     print('lemma', name)
 
     # Step -1: auto-detect axioms (bodyless functions)
@@ -380,10 +396,12 @@ def lemma1(lemma, p, stats):
 
     x = r.code
     _current_last_code = x or ""
-    _append_sample_event("llm_returned", code=_current_last_code, think=r.think)
+    _append_sample_event("llm_returned", code=_current_last_code, think=r.think,
+                         tool_calls=dict(_tool_calls), llm_calls=_llm_call_count)
     if x is None:
         print("LLM did not return valid Dafny")
         stats[name] = 2
+        stats['calls_' + name] = {"tool_calls": dict(_tool_calls), "llm_calls": _llm_call_count}
         return
 
     # Verify the final result
@@ -393,12 +411,16 @@ def lemma1(lemma, p, stats):
         print("LLM repair succeeded")
         stats[name] = 1
         stats['proof_' + name] = x
-        _append_sample_event("lemma_solved", code=x, program=p_final)
+        stats['calls_' + name] = {"tool_calls": dict(_tool_calls), "llm_calls": _llm_call_count}
+        _append_sample_event("lemma_solved", code=x, program=p_final,
+                             tool_calls=dict(_tool_calls), llm_calls=_llm_call_count)
     else:
         print("LLM repair failed - still has errors")
         stats[name] = 2
         stats['failed_proof_' + name] = x
-        _append_sample_event("lemma_unsolved", code=x, program=p_final, errors=format_errors(e_final))
+        stats['calls_' + name] = {"tool_calls": dict(_tool_calls), "llm_calls": _llm_call_count}
+        _append_sample_event("lemma_unsolved", code=x, program=p_final, errors=format_errors(e_final),
+                             tool_calls=dict(_tool_calls), llm_calls=_llm_call_count)
 
 
 # ---------------------------------------------------------------------------
