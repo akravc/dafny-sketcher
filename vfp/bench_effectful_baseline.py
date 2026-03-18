@@ -52,7 +52,6 @@ def _fixed_create_model(__model_name, **kwargs):
             fixed[k] = v
     return _orig_create_model(__model_name, **fixed)
 _pydantic.create_model = _fixed_create_model
-from error_parser import parse_dafny_errors, extract_proof_obligations, format_errors_structured, format_proof_obligations
 from fine import format_errors
 from pydantic import BaseModel, Field
 
@@ -68,7 +67,7 @@ _orig_completion = litellm.completion
 def _traced_completion(*args, **kwargs):
     global _llm_call_count
     model = kwargs.get("model", args[0] if args else "unknown")
-    kwargs.setdefault("timeout", 600)  # 10-minute timeout for structured output + multi-turn tool calls
+    kwargs.setdefault("timeout", 600)  # 10-minute timeout
     print(f"[LLM] Querying {model} ...", flush=True)
     _llm_call_count += 1
     result = _orig_completion(*args, **kwargs)
@@ -102,7 +101,7 @@ _current_lemma_name: Optional[str] = None
 _current_sample_index = 0
 _current_last_code: str = ""
 
-# Per-lemma tool call counter: tool_name -> count
+# Per-lemma tool call counter and LLM call counter
 _tool_calls: dict[str, int] = {}
 _llm_call_count = 0
 
@@ -143,18 +142,18 @@ class VerificationError(Exception):
 @Tool.define
 def execute(dafny_program: str) -> str:
     """Execute/verify a Dafny program.
-    
+
     This tool verifies the entire program and raises an error if verification fails.
     When used with RetryLLMHandler, the LLM will be retried automatically
     when verification errors occur. After MAX_VERIFICATION_ATTEMPTS failed attempts
     for this lemma, returns a message instead of raising so the loop stops.
 
     Args:
-        program: Full Dafny program source.
+        dafny_program: Full Dafny program source.
 
     Returns:
         "Verification succeeded" if the program verifies without errors.
-        
+
     Raises:
         VerificationError: If there are verification errors (until attempt limit reached).
     """
@@ -195,7 +194,7 @@ def induction_sketch(dafny_program: str, method_name: str) -> str:
     """Generate an induction proof sketch for a lemma.
 
     Args:
-        program: Full Dafny program source (the lemma body should be empty).
+        dafny_program: Full Dafny program source (the lemma body should be empty).
         method_name: Name of the lemma.
 
     Returns:
@@ -211,12 +210,12 @@ def induction_sketch(dafny_program: str, method_name: str) -> str:
 def insert_body(lemma_name: str, original_dafny_program: str, body: str) -> str:
     """Insert a proof body into a lemma and return the full program.
 
-    The lemma is identified by *lemma_name* inside *original_program*.
+    The lemma is identified by *lemma_name* inside *original_dafny_program*.
     *body* is the code to place inside the lemma braces.
 
     Args:
         lemma_name: Name of the lemma to fill in.
-        original_program: The original Dafny program (with empty lemma).
+        original_dafny_program: The original Dafny program (with empty lemma).
         body: The proof body to insert.
 
     Returns:
@@ -241,452 +240,6 @@ def insert_body(lemma_name: str, original_dafny_program: str, body: str) -> str:
     return result
 
 
-@Tool.define
-def verify_method(dafny_program: str, method_name: str) -> str:
-    """Verify ONLY a specific method/lemma (preferred over execute for single lemmas).
-
-    Args:
-        program: Full Dafny program source.
-        method_name: Name of the method/lemma to verify.
-
-    Returns:
-        Success or failure message with errors.
-    """
-    print(f"[TOOL] verify_method(method_name={method_name!r})", flush=True)
-    _track_tool("verify_method")
-    errs = sketcher.list_errors_for_method(dafny_program, method_name)
-    if errs:
-        return f"Verification failed for {method_name}:\n{format_errors(errs)}"
-    return f"Verification succeeded for {method_name}"
-
-
-@Tool.define
-def verify_isolated(dafny_program: str, lemma_name: str) -> str:
-    """Verify a lemma in isolation by stubbing all other lemma bodies with 'assume false;'.
-
-    Use this when other unproved lemmas cause cascading verification failures.
-
-    Args:
-        program: Full Dafny program source.
-        lemma_name: Name of the lemma to verify in isolation.
-
-    Returns:
-        Success or failure message.
-    """
-    print(f"[TOOL] verify_isolated(lemma_name={lemma_name!r})", flush=True)
-    _track_tool("verify_isolated")
-    done = sketcher.sketch_done(dafny_program)
-    if not done:
-        errs = sketcher.list_errors_for_method(dafny_program, lemma_name)
-        if errs:
-            return f"Verification failed for {lemma_name}:\n{format_errors(errs)}"
-        return f"Verification succeeded for {lemma_name}"
-
-    lines = dafny_program.splitlines(keepends=True)
-    for item in sorted(done, key=lambda x: x.get('startLine', 0), reverse=True):
-        if item.get('name') == lemma_name:
-            continue
-        if item.get('type') != 'lemma' or item.get('status') != 'done':
-            continue
-        start = item.get('insertLine', 0)
-        end = item.get('endLine', 0)
-        if start <= 0 or end <= 0 or start > end:
-            continue
-        body_start = start - 1
-        body_end = end
-        joined = ''.join(lines[body_start:body_end])
-        brace_open = joined.find('{')
-        if brace_open == -1:
-            continue
-        prefix = joined[:brace_open]
-        lines[body_start:body_end] = [prefix + "{ assume false; }\n"]
-
-    stubbed = ''.join(lines)
-    errs = sketcher.list_errors_for_method(stubbed, lemma_name)
-    if errs:
-        return f"Verification failed for {lemma_name} (isolated):\n{format_errors(errs)}"
-    return f"Verification succeeded for {lemma_name} (isolated)"
-
-
-@Tool.define
-def detect_axiom(dafny_program: str, lemma_name: str) -> str:
-    """Check if a lemma depends on bodyless (uninterpreted) functions and is thus an axiom.
-
-    Args:
-        program: Full Dafny program source.
-        lemma_name: Name of the lemma to check.
-
-    Returns:
-        JSON with is_axiom flag and reason.
-    """
-    import re as _re
-    print(f"[TOOL] detect_axiom(lemma_name={lemma_name!r})", flush=True)
-    _track_tool("detect_axiom")
-    done = sketcher.sketch_done(dafny_program)
-    if not done:
-        return json.dumps({"lemma": lemma_name, "is_axiom": "unknown", "reason": "could not parse declarations"})
-
-    lemma = next((x for x in done if x.get('name') == lemma_name), None)
-    if lemma is None:
-        return json.dumps({"lemma": lemma_name, "is_axiom": "unknown", "reason": "lemma not found"})
-
-    bodyless_fns = [item['name'] for item in done
-                    if item.get('type') == 'function' and item.get('status') != 'done']
-
-    lines = dafny_program.splitlines()
-    start = lemma.get('startLine', 1) - 1
-    end = lemma.get('endLine', lemma.get('insertLine', start + 1))
-    lemma_sig = '\n'.join(lines[start:end])
-
-    is_axiom_attr = '{:axiom}' in lemma_sig
-    referenced_bodyless = [fn for fn in bodyless_fns if fn in lemma_sig]
-
-    if is_axiom_attr:
-        result = {"lemma": lemma_name, "is_axiom": True,
-                  "reason": "Has {:axiom} attribute"}
-    elif referenced_bodyless:
-        result = {"lemma": lemma_name, "is_axiom": True,
-                  "reason": f"Depends on bodyless function(s): {', '.join(referenced_bodyless)}"}
-    else:
-        result = {"lemma": lemma_name, "is_axiom": False,
-                  "reason": "All referenced functions have bodies. This lemma should be provable."}
-    return json.dumps(result, indent=2)
-
-
-@Tool.define
-def parse_errors_tool(dafny_program: str, method_name: str = "") -> str:
-    """Parse Dafny verification errors into structured format with categories and suggestions.
-
-    Categories: postcondition, precondition, assertion, decreases, timeout, calc, exists, forall.
-    Each error includes an actionable suggestion for fixing it.
-
-    Args:
-        program: Full Dafny program source.
-        method_name: Optional method/lemma name to filter errors for.
-
-    Returns:
-        Structured error report with proof obligations.
-    """
-    print(f"[TOOL] parse_errors(method_name={method_name!r})", flush=True)
-    _track_tool("parse_errors_tool")
-    raw = sketcher._show_errors_for_method_core(dafny_program, method_name or None)
-    if not raw:
-        return "No errors found."
-    errors = parse_dafny_errors(raw)
-    if not errors:
-        return "Verification succeeded (no errors parsed)."
-    parts = ["=== ERRORS ===", format_errors_structured(errors)]
-    obligations = extract_proof_obligations(errors, method_name)
-    if obligations:
-        parts.extend(["", "=== PROOF OBLIGATIONS ===", format_proof_obligations(obligations)])
-    return "\n".join(parts)
-
-
-@Tool.define
-def counterexamples(dafny_program: str, method_name: str) -> str:
-    """Get counterexamples for a lemma to understand why it fails.
-
-    Shows concrete input values that make the lemma's postcondition false.
-
-    Args:
-        program: Full Dafny program source.
-        method_name: Name of the lemma.
-
-    Returns:
-        List of counterexample conditions, or a message if none found.
-    """
-    print(f"[TOOL] counterexamples(method_name={method_name!r})", flush=True)
-    _track_tool("counterexamples")
-    results = sketcher.sketch_counterexamples(dafny_program, method_name)
-    if isinstance(results, str):
-        return results
-    if results:
-        return "Counterexamples (conditions where the lemma fails):\n" + \
-               "\n".join(f"  {i}. {ce}" for i, ce in enumerate(results, 1))
-    return "No counterexamples found (lemma may be correct)."
-
-
-@Tool.define
-def find_relevant(dafny_program: str, lemma_name: str) -> str:
-    """Find declarations (functions, lemmas, predicates) relevant to proving a lemma.
-
-    Analyzes the lemma's signature and ensures clauses to find referenced declarations.
-
-    Args:
-        program: Full Dafny program source.
-        lemma_name: Name of the lemma to analyze.
-
-    Returns:
-        List of relevant declarations with their types and body status.
-    """
-    import re as _re
-    print(f"[TOOL] find_relevant(lemma_name={lemma_name!r})", flush=True)
-    _track_tool("find_relevant")
-    done = sketcher.sketch_done(dafny_program)
-    lines = dafny_program.splitlines()
-    target = next((x for x in (done or []) if x.get('name') == lemma_name), None)
-    if not target:
-        return f"Lemma '{lemma_name}' not found."
-
-    start = target.get('startLine', 1) - 1
-    end = target.get('endLine', start + 1)
-    sig_region = '\n'.join(lines[start:end])
-    identifiers = set(_re.findall(r'\b([A-Za-z_]\w*)\b', sig_region))
-    keywords = {'lemma', 'function', 'method', 'predicate', 'requires', 'ensures',
-                'decreases', 'modifies', 'reads', 'returns', 'var', 'if', 'else',
-                'then', 'match', 'case', 'forall', 'exists', 'true', 'false',
-                'int', 'nat', 'bool', 'string', 'seq', 'set', 'map', 'multiset',
-                'ghost', 'opaque', 'old', 'fresh', 'allocated', 'null', 'this',
-                'assert', 'assume', 'calc', 'reveal', 'while', 'for', 'return',
-                lemma_name}
-    identifiers -= keywords
-
-    relevant = []
-    for item in (done or []):
-        name = item.get('name', '')
-        if name == lemma_name or name in keywords:
-            continue
-        if name in identifiers:
-            kind = item.get('type', '?')
-            has_body = item.get('status') == 'done'
-            s = item.get('startLine', 1) - 1
-            sig = lines[s].strip() if s < len(lines) else ''
-            relevant.append(f"  [{kind}] {name} ({'has body' if has_body else 'NO BODY'}): {sig}")
-
-    if relevant:
-        return f"Declarations relevant to '{lemma_name}':\n" + "\n".join(relevant)
-    return f"No directly relevant declarations found for '{lemma_name}'."
-
-
-@Tool.define
-def search_lemmas(dafny_program: str, pattern: str) -> str:
-    """Search for lemmas/functions by name pattern or keyword in a program.
-
-    Args:
-        program: Full Dafny program source.
-        pattern: Search pattern (case-insensitive substring match).
-
-    Returns:
-        Matching declarations with line numbers.
-    """
-    import re as _re
-    print(f"[TOOL] search_lemmas(pattern={pattern!r})", flush=True)
-    _track_tool("search_lemmas")
-    pat = pattern.lower()
-    results = []
-    lines = dafny_program.splitlines()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if _re.match(r'^(lemma|function|predicate|ghost\s+function|ghost\s+method|method)\b', stripped):
-            sig_lines = [stripped]
-            for j in range(i + 1, min(i + 10, len(lines))):
-                next_line = lines[j].strip()
-                if next_line.startswith(('requires', 'ensures', 'decreases', 'modifies', 'reads')):
-                    sig_lines.append(next_line)
-                elif next_line == '{' or next_line == '' or _re.match(r'^(lemma|function|predicate|ghost|method|class|module|datatype)\b', next_line):
-                    break
-                else:
-                    sig_lines.append(next_line)
-                    if '{' in next_line:
-                        break
-            full_sig = ' '.join(sig_lines)
-            if pat in full_sig.lower():
-                results.append(f"  Line {i+1}: {full_sig.rstrip('{').strip()}")
-
-    if results:
-        return f"Found {len(results)} matching declaration(s):\n" + "\n".join(results)
-    return f"No declarations matching '{pattern}' found."
-
-
-@Tool.define
-def analyze_induction(dafny_program: str, lemma_name: str) -> str:
-    """Analyze the induction structure of a lemma: what to induct on, base/recursive cases.
-
-    Combines parameter analysis with the sketcher's induction sketch.
-
-    Args:
-        program: Full Dafny program source.
-        lemma_name: Name of the lemma to analyze.
-
-    Returns:
-        Induction analysis with candidates and sketch.
-    """
-    import re as _re
-    print(f"[TOOL] analyze_induction(lemma_name={lemma_name!r})", flush=True)
-    _track_tool("analyze_induction")
-
-    sketch = sketcher.sketch_induction(dafny_program, lemma_name)
-    if not sketch or "Error" in sketch:
-        sketch = sketcher.sketch_induction(dafny_program, lemma_name, shallow=True)
-
-    done = sketcher.sketch_done(dafny_program)
-    lines = dafny_program.splitlines()
-    lemma = next((x for x in (done or []) if x.get('name') == lemma_name), None)
-
-    analysis = [f"=== Induction Analysis for {lemma_name} ==="]
-    if lemma:
-        start = lemma.get('startLine', 1) - 1
-        insert = lemma.get('insertLine', start + 1)
-        sig = '\n'.join(lines[start:insert])
-        analysis.append(f"\nSignature:\n{sig}")
-        params = _re.findall(r'(\w+)\s*:\s*(\w[\w<>,._ ]*)', sig)
-        if params:
-            analysis.append(f"\nParameters: {', '.join(f'{n}: {t}' for n, t in params)}")
-            datatypes = {_re.match(r'^\s*datatype\s+(\w+)', l).group(1)
-                         for l in lines if _re.match(r'^\s*datatype\s+(\w+)', l)}
-            candidates = [(n, t) for n, t in params if t in datatypes or t in ('nat', 'Nat')]
-            if candidates:
-                analysis.append(f"Induction candidates: {', '.join(f'{n} ({t})' for n, t in candidates)}")
-
-    if sketch:
-        analysis.append(f"\nInduction sketch:\n{sketch}")
-    else:
-        analysis.append("\nNo induction sketch available. Try manual case analysis.")
-
-    return '\n'.join(analysis)
-
-
-@Tool.define
-def check_calc(dafny_program: str, lemma_name: str) -> str:
-    """Check each step of a calc block individually to find which step fails.
-
-    Isolates each transition (A op B) in a calc block and verifies it separately.
-
-    Args:
-        program: Full Dafny program source.
-        lemma_name: Name of the lemma containing the calc block.
-
-    Returns:
-        Per-step pass/fail report.
-    """
-    print(f"[TOOL] check_calc(lemma_name={lemma_name!r})", flush=True)
-    _track_tool("check_calc")
-    from calc_checker import check_calc_steps
-    return check_calc_steps(dafny_program, lemma_name)
-
-
-@Tool.define
-def dependency_order(dafny_program: str) -> str:
-    """Show the optimal order to solve lemmas based on their dependencies.
-
-    Analyzes which lemmas depend on which and returns a topological ordering.
-
-    Args:
-        program: Full Dafny program source.
-
-    Returns:
-        Ordered list of lemma names to solve.
-    """
-    print("[TOOL] dependency_order()", flush=True)
-    _track_tool("dependency_order")
-    from dependency_graph import get_solve_order
-    order = get_solve_order(dafny_program)
-    if order:
-        return "Recommended solve order:\n" + "\n".join(f"  {i}. {n}" for i, n in enumerate(order, 1))
-    return "No lemmas found to order."
-
-
-@Tool.define
-def dependency_info(dafny_program: str, lemma_name: str) -> str:
-    """Show what a specific lemma depends on (functions, other lemmas, predicates).
-
-    Args:
-        program: Full Dafny program source.
-        lemma_name: Name of the lemma to analyze.
-
-    Returns:
-        List of dependencies with their types and body status.
-    """
-    print(f"[TOOL] dependency_info(lemma_name={lemma_name!r})", flush=True)
-    _track_tool("dependency_info")
-    from dependency_graph import format_dependency_info
-    return format_dependency_info(dafny_program, lemma_name)
-
-
-@Tool.define
-def inspect_function(dafny_program: str, name: str) -> str:
-    """Check if a function/lemma is opaque, axiom, or has a body.
-
-    Args:
-        program: Full Dafny program source.
-        name: Name of the declaration to inspect.
-
-    Returns:
-        JSON with properties: has_body, is_axiom, is_opaque, is_ghost, etc.
-    """
-    print(f"[TOOL] inspect_function(name={name!r})", flush=True)
-    _track_tool("inspect_function")
-    done = sketcher.sketch_done(dafny_program)
-    item = next((x for x in (done or []) if x.get('name') == name), None)
-    if item is None:
-        return f"Declaration '{name}' not found"
-
-    lines = dafny_program.splitlines()
-    start_line = item.get('startLine', 0) - 1
-    end_line = item.get('endLine', 0) - 1
-    decl_text = '\n'.join(lines[start_line:end_line+1]) if start_line >= 0 else ''
-
-    info = {
-        'name': name,
-        'type': item.get('type', '?'),
-        'status': item.get('status', '?'),
-        'has_body': item.get('status') == 'done',
-        'is_axiom': '{:axiom}' in decl_text,
-        'is_opaque': 'opaque' in decl_text.split(name)[0] if name in decl_text else False,
-        'is_ghost': 'ghost' in decl_text.split(name)[0] if name in decl_text else False,
-    }
-    if info['type'] == 'function' and not info['has_body']:
-        info['note'] = 'No body (uninterpreted). Lemmas about it may be axioms.'
-    if info['is_axiom']:
-        info['note'] = 'This is an axiom — cannot be proved, only assumed.'
-    if info['is_opaque']:
-        info['note'] = f'Opaque. Need "reveal {name}();" in proof to use its definition.'
-    return json.dumps(info, indent=2)
-
-
-@Tool.define
-def list_declarations(dafny_program: str) -> str:
-    """List all declarations (lemmas, functions, methods) with their signatures and flags.
-
-    Args:
-        program: Full Dafny program source.
-
-    Returns:
-        List of declarations with [axiom]/[no-body] flags.
-    """
-    import re as _re
-    print("[TOOL] list_declarations()", flush=True)
-    _track_tool("list_declarations")
-    done = sketcher.sketch_done(dafny_program)
-    lines = dafny_program.splitlines()
-    if not done:
-        results = []
-        for line in lines:
-            stripped = line.strip()
-            if _re.match(r'^(lemma|function|method|predicate|ghost\s+function|ghost\s+method)\b', stripped):
-                results.append(stripped.rstrip('{').strip())
-        return '\n'.join(results) if results else "No declarations found."
-
-    parts = []
-    for item in done:
-        kind = item.get('type', '?')
-        name = item.get('name', '?')
-        has_body = item.get('status') == 'done'
-        start = item.get('startLine', 0)
-        axiom = '{:axiom}' in lines[start-1] if start > 0 and start <= len(lines) else False
-        flags = []
-        if axiom:
-            flags.append('axiom')
-        if not has_body:
-            flags.append('no-body')
-        flag_str = f" [{', '.join(flags)}]" if flags else ""
-        insert = item.get('insertLine', start)
-        sig_lines = lines[start-1:insert] if start > 0 else []
-        sig = ' '.join(l.strip() for l in sig_lines).rstrip('{').strip()
-        parts.append(f"[{kind}] {name}{flag_str}: {sig}")
-    return '\n'.join(parts)
-
-
 # ---------------------------------------------------------------------------
 # Template – the LLM-powered lemma implementer
 # ---------------------------------------------------------------------------
@@ -707,28 +260,16 @@ The lemma to implement is {lemma_name}.
 The current verification errors are:
 {errors}
 
-Available tools:
-- VERIFICATION: `execute`, `verify_method`, `verify_isolated`, `parse_errors_tool`
-- ANALYSIS: `detect_axiom`, `inspect_function`, `list_declarations`, `counterexamples`, `find_relevant`, `search_lemmas`
-- PROOF: `induction_sketch`, `analyze_induction`, `insert_body`, `check_calc`
-- DEPENDENCIES: `dependency_order`, `dependency_info`
-- PERSISTENCE: `read_persistence_memory`, `write_to_persistence_memory`
-
 Your goal:
-1. Read persistence memory for insights from previous lemmas.
-2. Use `detect_axiom` to check if the lemma is provable.
-3. Use `find_relevant` and `inspect_function` to understand available functions/lemmas.
-4. Use `analyze_induction` or `induction_sketch` for a proof sketch.
-5. Use `insert_body` to insert your proposed proof body.
-6. Use `verify_method` (preferred) or `execute` to verify. If it fails, use `parse_errors_tool` for structured error analysis.
-7. If other unproved lemmas cause cascading failures, use `verify_isolated`.
-8. If your proof uses a calc block, use `check_calc` to find which step fails.
-9. Use `counterexamples` if you need to understand what cases fail.
-10. When verification succeeds, return ONLY the final proof body (without the outer braces), starting with "// BEGIN DAFNY" and ending with "// END DAFNY".
-11. If execute() returns a message saying "Max verification attempts reached", return your current best proof body in the same format.
-12. If you discover the lemma is an axiom / unprovable, return "// AXIOM".
+1. Use the `induction_sketch` tool to get a proof sketch if it seems useful.
+2. Use the `insert_body` tool to insert your proposed proof body.
+3. Use the `execute` tool to verify the proof. If it raises an error, the system
+   will automatically retry, giving you a chance to refine your solution.
+4. Iterate: if verification fails (error is raised), refine the body and try again.
+5. When verification succeeds (execute returns successfully), return ONLY the final proof body (without the outer braces), starting with "// BEGIN DAFNY" and ending with "// END DAFNY".
+6. If execute() returns a message saying "Max verification attempts reached", return your current best proof body in the same format (// BEGIN DAFNY ... // END DAFNY).
 
-Write useful insights to persistence memory for future lemmas.
+Think, and provie your implementation of the lemma. If you find something useful, write it to the persistence memory using the `write_to_persistence_memory` tool, and read previous runs' persistence memory using the `read_persistence_memory` tool.
 """
     raise NotHandled
 
@@ -860,6 +401,7 @@ def lemma1(lemma, p, stats):
     if x is None:
         print("LLM did not return valid Dafny")
         stats[name] = 2
+        stats['calls_' + name] = {"tool_calls": dict(_tool_calls), "llm_calls": _llm_call_count}
         return
 
     # Verify the final result

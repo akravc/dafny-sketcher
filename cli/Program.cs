@@ -224,7 +224,21 @@ namespace DafnySketcherCli {
     public async static Task<List<(int line, int col, string msg)>> GetDiagnosticsAsync(string filePath, bool includeWarnings)
     {
       // 2) Invoke `dafny verify` normally and capture its text output
-      var psi = new ProcessStartInfo("dafny", $"verify \"{filePath}\"")
+      var dafnyExe = Environment.GetEnvironmentVariable("DAFNY") ?? "dafny";
+      string fileName;
+      string arguments;
+      if (dafnyExe.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+      {
+        fileName = "dotnet";
+        var dllPath = Path.IsPathRooted(dafnyExe) ? dafnyExe : Path.GetFullPath(dafnyExe);
+        arguments = $"\"{dllPath}\" verify \"{filePath}\"";
+      }
+      else
+      {
+        fileName = dafnyExe;
+        arguments = $"verify \"{filePath}\"";
+      }
+      var psi = new ProcessStartInfo(fileName, arguments)
       {
         RedirectStandardOutput = true,
         RedirectStandardError = true,
@@ -266,39 +280,37 @@ namespace DafnySketcherCli {
     public static List<Unit> ListTODOs(Microsoft.Dafny.Program dafnyProgram)
     {
       var todos = new List<Unit>();
-      if (dafnyProgram.DefaultModuleDef is DefaultModuleDefinition defaultModule)
+      foreach (var (member, modulePath) in Utility.GetAllMembersDeduped(dafnyProgram))
       {
-        foreach (var (member, _) in defaultModule.AccessibleMembers)
+        if (member is MethodOrFunction m)
         {
-          if (member is MethodOrFunction m)
+          string? type = null;
+          if (m.HasAxiomAttribute)
           {
-            string? type = null;
-            if (m.HasAxiomAttribute)
+            type = "lemma";
+          }
+          else if (m is Function f)
+          {
+            if (f.Body == null)
             {
-              type = "lemma";
+              type = "function";
             }
-            else if (m is Function f)
+          }
+          if (type != null)
+          {
+            todos.Add(new Unit
             {
-              if (f.Body == null)
-              {
-                type = "function";
-              }
-            }
-            if (type != null)
-            {
-              todos.Add(new Unit
-              {
-                Name = m.Name,
-                startLine = m.StartToken.line,
-                startColumn = m.StartToken.col,
-                InsertLine = m.EndToken.line,
-                InsertColumn = m.EndToken.col,
-                EndLine = m.EndToken.line,
-                EndColumn = m.EndToken.col,
-                Type = type,
-                Status = "todo"
-              });
-            }
+              Name = m.Name,
+              startLine = m.StartToken.line,
+              startColumn = m.StartToken.col,
+              InsertLine = m.EndToken.line,
+              InsertColumn = m.EndToken.col,
+              EndLine = m.EndToken.line,
+              EndColumn = m.EndToken.col,
+              Type = type,
+              Status = "todo",
+              Module = string.IsNullOrEmpty(modulePath) ? null : modulePath
+            });
           }
         }
       }
@@ -307,43 +319,41 @@ namespace DafnySketcherCli {
     public static List<Unit> ListImplementedUnits(Microsoft.Dafny.Program dafnyProgram)
     {
       var units = new List<Unit>();
-      if (dafnyProgram.DefaultModuleDef is DefaultModuleDefinition defaultModule)
+      foreach (var (member, modulePath) in Utility.GetAllMembersDeduped(dafnyProgram))
       {
-        foreach (var (member, _) in defaultModule.AccessibleMembers)
+        if (member is MethodOrFunction m)
         {
-          if (member is MethodOrFunction m)
+          string? type = null;
+          if (m is Function f)
           {
-            string? type = null;
-            if (m is Function f)
+            if (f.Body != null)
             {
-              if (f.Body != null)
+              var isSpec = f.Attributes != null && f.Attributes.Name == "spec";
+              if (!isSpec)
               {
-                var isSpec = f.Attributes != null && f.Attributes.Name == "spec";
-                if (!isSpec)
-                {
-                  type = "function";
-                }
+                type = "function";
               }
             }
-            else if (!m.HasAxiomAttribute && m.IsGhost)
+          }
+          else if (!m.HasAxiomAttribute && m.IsGhost)
+          {
+            type = "lemma";
+          }
+          if (type != null)
+          {
+            units.Add(new Unit
             {
-              type = "lemma";
-            }
-            if (type != null)
-            {
-              units.Add(new Unit
-              {
-                Name = m.Name,
-                startLine = m.StartToken.line,
-                startColumn = m.StartToken.col,
-                InsertLine = m.BodyStartTok.line,
-                InsertColumn = m.BodyStartTok.col,
-                EndLine = m.EndToken.line,
-                EndColumn = m.EndToken.col,
-                Type = type,
-                Status = "done"
-              });
-            }
+              Name = m.Name,
+              startLine = m.StartToken.line,
+              startColumn = m.StartToken.col,
+              InsertLine = m.BodyStartTok.line,
+              InsertColumn = m.BodyStartTok.col,
+              EndLine = m.EndToken.line,
+              EndColumn = m.EndToken.col,
+              Type = type,
+              Status = "done",
+              Module = string.IsNullOrEmpty(modulePath) ? null : modulePath
+            });
           }
         }
       }
@@ -352,27 +362,25 @@ namespace DafnySketcherCli {
     public static List<Unit> ListAllLemmas(Microsoft.Dafny.Program dafnyProgram)
     {
       var units = new List<Unit>();
-      if (dafnyProgram.DefaultModuleDef is DefaultModuleDefinition defaultModule)
+      foreach (var (member, modulePath) in Utility.GetAllMembersDeduped(dafnyProgram))
       {
-        foreach (var (member, _) in defaultModule.AccessibleMembers)
+        if (member is MethodOrFunction m)
         {
-          if (member is MethodOrFunction m)
+          if (m.IsGhost)
           {
-            if (m.IsGhost)
+            units.Add(new Unit
             {
-              units.Add(new Unit
-              {
-                Name = m.Name,
-                startLine = m.StartToken.line,
-                startColumn = m.StartToken.col,
-                InsertLine = m.BodyStartTok.line,
-                InsertColumn = m.BodyStartTok.col,
-                EndLine = m.EndToken.line,
-                EndColumn = m.EndToken.col,
-                Type = "lemma",
-                Status = "any"
-              });
-            }
+              Name = m.Name,
+              startLine = m.StartToken.line,
+              startColumn = m.StartToken.col,
+              InsertLine = m.BodyStartTok.line,
+              InsertColumn = m.BodyStartTok.col,
+              EndLine = m.EndToken.line,
+              EndColumn = m.EndToken.col,
+              Type = "lemma",
+              Status = "any",
+              Module = string.IsNullOrEmpty(modulePath) ? null : modulePath
+            });
           }
         }
       }
@@ -381,14 +389,11 @@ namespace DafnySketcherCli {
     public static List<ProofLine> ListProofLines(Microsoft.Dafny.Program dafnyProgram)
     {
       var lines = new List<ProofLine>();
-      if (dafnyProgram.DefaultModuleDef is DefaultModuleDefinition defaultModule)
+      foreach (var (member, _) in Utility.GetAllMembersDeduped(dafnyProgram))
       {
-        foreach (var (member, _) in defaultModule.AccessibleMembers)
+        if (member is Method m)
         {
-          if (member is Method m)
-          {
-            lines.AddRange(ListProofLinesInMethod(m));
-          }
+          lines.AddRange(ListProofLinesInMethod(m));
         }
       }
       return lines;
@@ -468,6 +473,9 @@ namespace DafnySketcherCli {
     required public string Type { get; set; }
     [JsonPropertyName("status")]
     required public string Status { get; set; }
+    [JsonPropertyName("module")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Module { get; set; }
   }
   public class ProofLine
   {
