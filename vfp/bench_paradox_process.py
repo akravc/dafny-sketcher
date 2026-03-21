@@ -40,6 +40,7 @@ LLM_MODEL = os.environ.get('LLM_MODEL', None)
 DEFAULT_OUT_PATH = str(_repo_root / "vfp" / "bench_paradox_process_latest.json")
 OUT_PATH = DEFAULT_OUT_PATH
 N_ITERATIONS = 3
+MAX_LLM_CALLS = None  # None = unlimited, 2 = explain+1 repair, 3 = explain+2 repairs
 PROCESS_ONLY = False
 
 # Override generate if --model is passed (use litellm instead of default)
@@ -188,9 +189,11 @@ def lemma1(lemma, p, stats):
         explanation = ""
 
     if explanation:
-        print("  [process] starting repair loop with process explanation...")
+        # MAX_LLM_CALLS counts the explanation call too, so repair iterations = MAX_LLM_CALLS - 1
+        n_repair = (MAX_LLM_CALLS - 1) if MAX_LLM_CALLS else N_ITERATIONS
+        print(f"  [process] starting repair loop with process explanation (max {n_repair} repairs)...")
         proc_iter, proc_proof = repair_loop_with_process(
-            lemma, init_p, "", name, explanation, N_ITERATIONS
+            lemma, init_p, "", name, explanation, n_repair
         )
         if proc_iter is not None:
             print(f"  [process] solved at iteration {proc_iter}")
@@ -336,6 +339,8 @@ if __name__ == "__main__":
     parser.add_argument('--iterations', type=int, default=3)
     parser.add_argument('--process-only', action='store_true',
                         help='Only run Mode C (process), skip A and B')
+    parser.add_argument('--max-llm-calls', type=int, default=None,
+                        help='Max LLM calls per lemma for process mode (e.g. 2=explain+1repair, 3=explain+2repairs)')
     args, remaining = parser.parse_known_args()
 
     if args.model:
@@ -347,6 +352,7 @@ if __name__ == "__main__":
     OUT_PATH = args.out
     N_ITERATIONS = args.iterations
     PROCESS_ONLY = args.process_only
+    MAX_LLM_CALLS = args.max_llm_calls
 
     sys.argv = [sys.argv[0]] + remaining
     bench_driver.run(lemma1, print_stats)
