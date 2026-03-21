@@ -65,24 +65,21 @@ def _litellm_generate(prompt, max_tokens=4000, temperature=0.0, model=None):
 # Process supervision: ask LLM to explain the sketch
 # ---------------------------------------------------------------------------
 
-def generate_process_explanation(program: str, name: str, skeleton: str, body: str) -> str:
+def generate_process_explanation(program: str, name: str, skeleton: str) -> str:
     """Ask the LLM to explain the reasoning process behind the correct sketch.
 
     This simulates "process supervision" — rather than giving the outcome (sketch),
     we ask the model to reconstruct the thinking that would lead to it.
     """
     prompt = f"""You are a Dafny proof expert. A lemma needs to be proved, and someone has
-proposed the following proof skeleton (case structure):
+proposed the following proof skeleton (just the case structure with empty branches):
 
 Program:
 {program}
 
 Lemma to prove: {name}
 
-The correct proof body (from the solution) is:
-{body}
-
-The skeleton (just the case structure with empty branches) is:
+The skeleton (case structure with empty branches) is:
 {skeleton}
 
 Please explain step by step:
@@ -182,7 +179,7 @@ def lemma1(lemma, p, stats):
     # --- Mode C: process explanation + repair ---
     print("  [process] generating explanation...")
     try:
-        explanation = generate_process_explanation(init_p, name, skeleton, body_text)
+        explanation = generate_process_explanation(init_p, name, skeleton)
         print(f"  [process] explanation generated ({len(explanation)} chars)")
     except Exception as ex:
         print(f"  [process] explanation failed: {ex}")
