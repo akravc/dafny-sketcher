@@ -211,7 +211,7 @@ if ANTHROPIC_API_KEY:
             debug("Received response from Anthropic")
             debug(f"Response:\n{message}")
             return message.content[0].text
-        models['claude'] = model
+        models['claude'] = "claude-3-7-sonnet-20250219"
     generators['claude'] = generate
 
 if GEMINI_API_KEY:

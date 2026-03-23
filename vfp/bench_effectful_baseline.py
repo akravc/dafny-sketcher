@@ -58,6 +58,7 @@ from pydantic import BaseModel, Field
 _repo_root = Path(__file__).resolve().parent.parent
 
 load_dotenv(_repo_root / ".env")
+load_dotenv(_repo_root / "vfp" / ".env")
 if not os.environ.get("DAFNY"):
     _dafny_dll = _repo_root / "dafny" / "Binaries" / "Dafny.dll"
     if _dafny_dll.exists():
@@ -74,6 +75,21 @@ def _traced_completion(*args, **kwargs):
     print(f"[LLM] Response received from {model}", flush=True)
     return result
 litellm.completion = _traced_completion
+
+# Also patch effectful's completion Operation so LLM call tracking works
+# (effectful captures litellm.completion at import time, before our patch)
+from effectful.handlers.llm import completions as _effl_completions
+_effl_orig = _effl_completions.completion.__wrapped__
+def _effl_traced(*args, **kwargs):
+    global _llm_call_count
+    kwargs.setdefault("timeout", 600)
+    model = kwargs.get("model", args[0] if args else "unknown")
+    print(f"[LLM] Querying {model} ...", flush=True)
+    _llm_call_count += 1
+    result = _effl_orig(*args, **kwargs)
+    print(f"[LLM] Response received from {model}", flush=True)
+    return result
+_effl_completions.completion.__wrapped__ = _effl_traced
 
 # ---------------------------------------------------------------------------
 # Configuration
