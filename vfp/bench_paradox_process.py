@@ -29,14 +29,12 @@ Usage:
 import argparse
 import json
 import sys
-from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 import bench_driver
 import driver
-import litellm
 import sketcher
 from fine import format_errors
 from driver import extract_dafny_program
@@ -45,35 +43,17 @@ from bench_paradox import extract_skeleton, prompt_lemma_implementer
 _repo_root = Path(__file__).resolve().parent.parent
 
 
-@dataclass
-class Config:
-    llm_model: str | None = None
-    n_iterations: int = 3
-    max_llm_calls: int | None = None
-    process_only: bool = False
-    out_path: str = str(_repo_root / "vfp" / "bench_paradox_process_latest.json")
-    temperature: float = 0.0
+def make_generate(model: str, temperature: float = 0.0) -> Callable[..., str]:
+    """Build a litellm-based generate function for the given model."""
+    import litellm
 
-
-def make_generate(config: Config) -> Callable[..., str]:
-    """Build the LLM generate function from config.
-
-    If config.llm_model is set, returns a litellm-based generator.
-    Otherwise, falls back to the default generator from llm.py.
-    """
-    if not config.llm_model:
-        from llm import default_generate
-        return default_generate
-
-    def generate(prompt, max_tokens=4000, temperature=None, model=None):
-        m = model or config.llm_model
-        t = temperature if temperature is not None else config.temperature
-        print(f"[LLM] Querying {m} ...", flush=True)
+    def generate(prompt, max_tokens=4000, temperature=temperature, model=model):
+        print(f"[LLM] Querying {model} ...", flush=True)
         resp = litellm.completion(
-            model=m,
+            model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
-            temperature=t,
+            temperature=temperature,
             timeout=600,
         )
         result = resp.choices[0].message.content
@@ -87,16 +67,7 @@ def make_generate(config: Config) -> Callable[..., str]:
 # Process supervision: ask LLM to explain the skeleton
 # ---------------------------------------------------------------------------
 
-def generate_process_explanation(
-    program: str, name: str, skeleton: str, generate: Callable[..., str],
-) -> str:
-    """Ask the LLM to explain the reasoning behind a proof skeleton.
-
-    The prompt receives ONLY the skeleton (case structure with empty branches),
-    NOT the correct proof body. This simulates "process supervision" — asking
-    the model to reconstruct the thinking that would lead to the sketch.
-    """
-    prompt = f"""You are a Dafny proof expert. A lemma needs to be proved, and someone has
+PROCESS_PROMPT = """You are a Dafny proof expert. A lemma needs to be proved, and someone has
 proposed the following proof skeleton (just the case structure with empty branches):
 
 Program:
@@ -115,52 +86,6 @@ Please explain step by step:
 
 Be specific about the Dafny functions and predicates involved. This explanation will be used to guide a proof search."""
 
-    return generate(prompt, max_tokens=4000)
-
-
-def repair_loop_with_process(
-    lemma: dict,
-    init_p: str,
-    start_body: str,
-    name: str,
-    process_explanation: str,
-    generate: Callable[..., str],
-    n_iterations: int = 3,
-) -> tuple[int | None, str]:
-    """Run LLM repair with process explanation prepended to the prompt.
-
-    Like bench_paradox.repair_loop but each repair prompt includes the
-    process explanation as context.
-
-    Returns (iteration, proof) on success or (None, last_attempt) on failure.
-    """
-    p = driver.insert_program_todo(lemma, init_p, start_body)
-    e = sketcher.list_errors_for_method(p, name)
-    if not e:
-        return (-1, start_body)
-
-    last_x = start_body
-    for i in range(n_iterations):
-        base_prompt = prompt_lemma_implementer(p, name, e)
-        prompt = f"""Before attempting the proof, here is an analysis of the proof strategy that should work for this lemma:
-
-{process_explanation}
-
-Now, using this analysis to guide your proof:
-
-{base_prompt}"""
-        r = generate(prompt)
-        x = extract_dafny_program(r)
-        if x is None:
-            continue
-        last_x = x
-        p = driver.insert_program_todo(lemma, init_p, x)
-        e = sketcher.list_errors_for_method(p, name)
-        if not e:
-            return (i, x)
-
-    return (None, last_x)
-
 
 def repair_loop(
     lemma: dict,
@@ -169,8 +94,12 @@ def repair_loop(
     name: str,
     generate: Callable[..., str],
     n_iterations: int = 3,
+    prompt_prefix: str = "",
 ) -> tuple[int | None, str]:
-    """Run LLM repair starting from start_body (no process explanation).
+    """Run n_iterations of LLM repair starting from start_body.
+
+    If prompt_prefix is non-empty, it is prepended to each repair prompt
+    (used for process supervision mode).
 
     Returns (iteration, proof) on success, (-1, start_body) if start_body
     already verifies, or (None, last_attempt) on failure.
@@ -182,7 +111,8 @@ def repair_loop(
 
     last_x = start_body
     for i in range(n_iterations):
-        prompt = prompt_lemma_implementer(p, name, e)
+        base_prompt = prompt_lemma_implementer(p, name, e)
+        prompt = prompt_prefix + base_prompt if prompt_prefix else base_prompt
         r = generate(prompt)
         x = extract_dafny_program(r)
         if x is None:
@@ -203,21 +133,12 @@ def repair_loop(
 def lemma1(lemma: dict, p: str, stats: dict) -> None:
     init_p = p
     name = lemma['name']
-    generate = _generate
-    config = _run_config
 
     print('lemma', name)
 
     # Extract the skeleton from the solution body
     lines = init_p.splitlines()
-    insert = lemma.get('insertLine', 0)
-    end = lemma.get('endLine', insert)
-    if insert >= len(lines) or end > len(lines):
-        print(f"  bad line range ({insert}:{end}), skipping")
-        stats[name] = {'empty': None, 'skeleton': None, 'process': None, 'skipped': True}
-        return
-
-    body_text = '\n'.join(lines[insert:end-1])
+    body_text = '\n'.join(lines[lemma['insertLine']:lemma['endLine']-1])
     skeleton = extract_skeleton(body_text)
     if skeleton is None:
         print("  solution has no case/if structure, skipping")
@@ -234,69 +155,70 @@ def lemma1(lemma: dict, p: str, stats: dict) -> None:
         stats[name] = {'empty': -1, 'skeleton': -1, 'process': -1, 'skipped': False}
         return
 
+    generate = _generate
+    n_iter = _n_iterations
+
     # --- Mode A & B: empty and skeleton repair ---
-    if not config.process_only:
+    if not _process_only:
         print("  [empty] starting repair loop...")
-        empty_iter, empty_proof = repair_loop(
-            lemma, init_p, "", name, generate, config.n_iterations)
-        if empty_iter is not None:
-            print(f"  [empty] solved at iteration {empty_iter}")
-        else:
-            print("  [empty] failed")
+        empty_iter, empty_proof = repair_loop(lemma, init_p, "", name, generate, n_iter)
+        print(f"  [empty] {'solved at iteration ' + str(empty_iter) if empty_iter is not None else 'failed'}")
 
         print("  [skeleton] starting repair loop...")
-        skel_iter, skel_proof = repair_loop(
-            lemma, init_p, skeleton, name, generate, config.n_iterations)
-        if skel_iter is not None:
-            print(f"  [skeleton] solved at iteration {skel_iter}")
-        else:
-            print("  [skeleton] failed")
+        skel_iter, skel_proof = repair_loop(lemma, init_p, skeleton, name, generate, n_iter)
+        print(f"  [skeleton] {'solved at iteration ' + str(skel_iter) if skel_iter is not None else 'failed'}")
     else:
-        empty_iter, empty_proof = None, ""
-        skel_iter, skel_proof = None, ""
+        empty_iter = skel_iter = None
+        empty_proof = skel_proof = ""
 
     # --- Mode C: process explanation + repair ---
     print("  [process] generating explanation...")
     explanation = ""
     explanation_error = None
     try:
-        explanation = generate_process_explanation(init_p, name, skeleton, generate)
+        explanation = generate(
+            PROCESS_PROMPT.format(program=init_p, name=name, skeleton=skeleton),
+            max_tokens=4000,
+        )
         print(f"  [process] explanation generated ({len(explanation)} chars)")
     except Exception as ex:
         explanation_error = str(ex)
         print(f"  [process] explanation failed: {ex}")
 
     if explanation:
-        n_repair = (config.max_llm_calls - 1) if config.max_llm_calls else config.n_iterations
+        n_repair = (_max_llm_calls - 1) if _max_llm_calls else n_iter
+        prefix = f"""Before attempting the proof, here is an analysis of the proof strategy that should work for this lemma:
+
+{explanation}
+
+Now, using this analysis to guide your proof:
+
+"""
         print(f"  [process] starting repair loop (max {n_repair} repairs)...")
-        proc_iter, proc_proof = repair_loop_with_process(
-            lemma, init_p, "", name, explanation, generate, n_repair)
-        if proc_iter is not None:
-            print(f"  [process] solved at iteration {proc_iter}")
-        else:
-            print("  [process] failed")
+        proc_iter, proc_proof = repair_loop(
+            lemma, init_p, "", name, generate, n_repair, prompt_prefix=prefix)
+        print(f"  [process] {'solved at iteration ' + str(proc_iter) if proc_iter is not None else 'failed'}")
     else:
         proc_iter, proc_proof = None, ""
 
-    result: dict = {
+    entry = {
         'empty': empty_iter,
         'skeleton': skel_iter,
         'process': proc_iter,
         'skipped': False,
     }
     if explanation_error:
-        result['process_error'] = explanation_error
-
-    stats[name] = result
+        entry['process_error'] = explanation_error
     if empty_iter is not None:
-        stats['proof_empty_' + name] = empty_proof
+        entry['proof_empty'] = empty_proof
     if skel_iter is not None:
-        stats['proof_skeleton_' + name] = skel_proof
+        entry['proof_skeleton'] = skel_proof
     if proc_iter is not None:
-        stats['proof_process_' + name] = proc_proof
+        entry['proof_process'] = proc_proof
     if explanation:
-        stats['explanation_' + name] = explanation
+        entry['explanation'] = explanation
 
+    stats[name] = entry
     save_run_state(stats)
 
 
@@ -304,78 +226,73 @@ def lemma1(lemma: dict, p: str, stats: dict) -> None:
 # Stats reporting
 # ---------------------------------------------------------------------------
 
-def _count_stats(stats: dict) -> dict:
-    """Compute all summary counts in a single pass."""
+def print_summary_stats(stats: dict) -> None:
     entries = {k: v for k, v in stats.items() if isinstance(v, dict)}
-    counts = {
-        'total': len(entries),
-        'skipped': 0, 'considered': 0,
-        'empty_solved': 0, 'skel_solved': 0, 'proc_solved': 0,
-        'neither_es': 0,
-        'proc_only_vs_skel': 0, 'skel_only_vs_proc': 0, 'both_ps': 0,
-        'proc_fewer_iter': 0, 'skel_fewer_iter': 0, 'same_iter': 0,
-        'proc_only_vs_empty': 0,
-    }
+    total = len(entries)
+    skipped = considered = 0
+    empty_solved = skel_solved = proc_solved = neither_es = 0
+    proc_only_vs_skel = skel_only_vs_proc = both_ps = 0
+    proc_fewer = skel_fewer = same = 0
+    proc_only_vs_empty = 0
+
     for v in entries.values():
         if v.get('skipped'):
-            counts['skipped'] += 1
+            skipped += 1
             continue
-        counts['considered'] += 1
+        considered += 1
         e, s, p = v.get('empty'), v.get('skeleton'), v.get('process')
-        if e is not None: counts['empty_solved'] += 1
-        if s is not None: counts['skel_solved'] += 1
-        if p is not None: counts['proc_solved'] += 1
-        if e is None and s is None: counts['neither_es'] += 1
-        # process vs skeleton
-        if p is not None and s is None: counts['proc_only_vs_skel'] += 1
-        elif s is not None and p is None: counts['skel_only_vs_proc'] += 1
+        if e is not None: empty_solved += 1
+        if s is not None: skel_solved += 1
+        if p is not None: proc_solved += 1
+        if e is None and s is None: neither_es += 1
+        if p is not None and s is None: proc_only_vs_skel += 1
+        elif s is not None and p is None: skel_only_vs_proc += 1
         elif p is not None and s is not None:
-            counts['both_ps'] += 1
-            if p < s: counts['proc_fewer_iter'] += 1
-            elif s < p: counts['skel_fewer_iter'] += 1
-            else: counts['same_iter'] += 1
-        # process vs empty
-        if p is not None and e is None: counts['proc_only_vs_empty'] += 1
-    return counts
+            both_ps += 1
+            if p < s: proc_fewer += 1
+            elif s < p: skel_fewer += 1
+            else: same += 1
+        if p is not None and e is None: proc_only_vs_empty += 1
 
-
-def print_summary_stats(stats: dict) -> None:
-    c = _count_stats(stats)
-
-    print(f'\ntotal lemmas: {c["total"]}')
-    print(f'skipped (no case/if structure): {c["skipped"]}')
-    print(f'considered: {c["considered"]}')
-    print(f'  empty solved:    {c["empty_solved"]}')
-    print(f'  skeleton solved: {c["skel_solved"]}')
-    print(f'  process solved:  {c["proc_solved"]}')
-    print(f'  neither (empty/skel): {c["neither_es"]}')
+    print(f'\ntotal lemmas: {total}')
+    print(f'skipped (no case/if structure): {skipped}')
+    print(f'considered: {considered}')
+    print(f'  empty solved:    {empty_solved}')
+    print(f'  skeleton solved: {skel_solved}')
+    print(f'  process solved:  {proc_solved}')
+    print(f'  neither (empty/skel): {neither_es}')
 
     # NOTE: when --process-only is used, skeleton=None for all non-trivial
     # lemmas, so "process-only solved" counts all process successes.
     print(f'\n  === Process vs Skeleton ===')
-    print(f'  process-only solved: {c["proc_only_vs_skel"]}')
-    print(f'  skeleton-only solved: {c["skel_only_vs_proc"]}')
-    if c['both_ps'] > 0:
+    print(f'  process-only solved: {proc_only_vs_skel}')
+    print(f'  skeleton-only solved: {skel_only_vs_proc}')
+    if both_ps > 0:
         # NOTE: process iteration 0 costs 2 LLM calls (explain + 1 repair)
-        # while skeleton iteration 0 costs 1 LLM call. This comparison
-        # reflects proof-attempt count, not total LLM cost.
-        print(f'  both solved: {c["both_ps"]}')
-        print(f'    process fewer iterations: {c["proc_fewer_iter"]}')
-        print(f'    skeleton fewer iterations: {c["skel_fewer_iter"]}')
-        print(f'    same iterations: {c["same_iter"]}')
+        # while skeleton iteration 0 costs 1. This compares proof-attempt
+        # count, not total LLM cost.
+        print(f'  both solved: {both_ps}')
+        print(f'    process fewer iterations: {proc_fewer}')
+        print(f'    skeleton fewer iterations: {skel_fewer}')
+        print(f'    same iterations: {same}')
 
     print(f'\n  === Process vs Empty ===')
-    print(f'  process-only solved: {c["proc_only_vs_empty"]}')
+    print(f'  process-only solved: {proc_only_vs_empty}')
 
 
 def save_run_state(stats: dict) -> None:
     payload = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "config": asdict(_run_config),
+        "config": {
+            "llm_model": _model_name,
+            "n_iterations": _n_iterations,
+            "max_llm_calls": _max_llm_calls,
+            "process_only": _process_only,
+        },
         "stats": stats,
     }
     try:
-        with open(_run_config.out_path, "w", encoding="utf-8") as f:
+        with open(_out_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=True)
     except Exception as e:
         print(f"failed to save: {e}")
@@ -397,10 +314,13 @@ def print_stats(stats: dict) -> None:
     save_run_state(stats)
 
 
-# Module-level state set by __main__ and read by lemma1.
-_run_config: Config = Config()
-_generate: Callable[..., str] = lambda *a, **k: (_ for _ in ()).throw(
-    RuntimeError("generate not initialized"))
+# Module-level state, set in __main__.
+_generate: Callable[..., str]
+_model_name: str | None = None
+_n_iterations: int = 3
+_max_llm_calls: int | None = None
+_process_only: bool = False
+_out_path: str = str(_repo_root / "vfp" / "bench_paradox_process_latest.json")
 
 
 if __name__ == "__main__":
@@ -411,7 +331,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--model', type=str, default=None,
                         help='litellm model (e.g. anthropic/claude-opus-4-6)')
-    parser.add_argument('--out', type=str, default=Config.out_path)
+    parser.add_argument('--out', type=str, default=_out_path)
     parser.add_argument('--iterations', type=int, default=3)
     parser.add_argument('--process-only', action='store_true',
                         help='Only run Mode C (process), skip A and B')
@@ -420,14 +340,17 @@ if __name__ == "__main__":
                              '(e.g. 2=explain+1repair, 3=explain+2repairs)')
     args, remaining = parser.parse_known_args()
 
-    _run_config = Config(
-        llm_model=args.model,
-        n_iterations=args.iterations,
-        max_llm_calls=args.max_llm_calls,
-        process_only=args.process_only,
-        out_path=args.out,
-    )
-    _generate = make_generate(_run_config)
+    _model_name = args.model
+    _n_iterations = args.iterations
+    _max_llm_calls = args.max_llm_calls
+    _process_only = args.process_only
+    _out_path = args.out
+
+    if args.model:
+        _generate = make_generate(args.model)
+    else:
+        from llm import default_generate
+        _generate = default_generate
 
     sys.argv = [sys.argv[0]] + remaining
     bench_driver.run(lemma1, print_stats)
