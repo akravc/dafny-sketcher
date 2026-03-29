@@ -43,14 +43,18 @@ if AWS_BEARER_TOKEN_BEDROCK:
     if generate is None:
         model = os.environ.get('ANTHROPIC_AWS_MODEL')
         if not model:
-            claude_model = os.environ.get('CLAUDE_MODEL', 'sonnet3')
-            if claude_model == 'opus' or claude_model == 'opus45':
+            claude_model = os.environ.get('CLAUDE_MODEL', 'sonnet')
+            if claude_model == 'opus' or claude_model == 'opus46':
+                model = 'global.anthropic.claude-opus-4-6-v1'
+            elif claude_model == 'opus45':
                 model = 'us.anthropic.claude-opus-4-5-20251101-v1:0'
             elif claude_model == 'opus41':
                 model = 'us.anthropic.claude-opus-4-1-20250805-v1:0'
             elif claude_model == 'sonnet3':
                 model = 'anthropic.claude-3-sonnet-20240229-v1:0'
-            elif claude_model == 'sonnet' or claude_model == 'sonnet45':
+            elif claude_model == 'sonnet' or claude_model == 'sonnet46':
+                model = 'global.anthropic.claude-sonnet-4-6'
+            elif claude_model == 'sonnet45':
                 model = 'global.anthropic.claude-sonnet-4-5-20250929-v1:0'
             elif claude_model == 'sonnet4':
                 model = 'global.anthropic.claude-sonnet-4-20250514-v1:0'
@@ -154,7 +158,8 @@ if OPENAI_API_KEY:
         OPENAI_BASE_URL = os.environ.get('OPENAI_BASE_URL')
         if OPENAI_BASE_URL:
             openai.base_url = OPENAI_BASE_URL
-        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model="gpt-4o"):
+        OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-4o')
+        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=OPENAI_MODEL):
             debug(f"Prompt:\n{prompt}")
             debug(f"Sending request to OpenAI (model={model}, max_tokens={max_tokens}, temp={temperature})")
 
@@ -171,7 +176,7 @@ if OPENAI_API_KEY:
             debug("Received response from OpenAI")
             debug(f"Response:\n{response}")
             return response
-        models['openai'] = model
+        models['openai'] = OPENAI_MODEL
     generators['openai'] = generate
 
 if ANTHROPIC_API_KEY:
@@ -181,7 +186,8 @@ if ANTHROPIC_API_KEY:
     except ModuleNotFoundError:
         generate = dummy_generate('anthropic')
     if generate is None:
-        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model="claude-3-7-sonnet-20250219"):
+        ANTHROPIC_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-3-7-sonnet-20250219')
+        def generate(prompt, max_tokens=1000, temperature=TEMPERATURE, model=ANTHROPIC_MODEL):
             debug(f"Prompt:\n{prompt}")
             debug(f"Sending request to Anthropic (model={model}, max_tokens={max_tokens}, temp={temperature})")
 
@@ -207,7 +213,7 @@ if ANTHROPIC_API_KEY:
             debug("Received response from Anthropic")
             debug(f"Response:\n{message}")
             return message.content[0].text
-        models['claude'] = model
+        models['claude'] = ANTHROPIC_MODEL
     generators['claude'] = generate
 
 if GEMINI_API_KEY:

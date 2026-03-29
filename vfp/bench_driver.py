@@ -28,7 +28,28 @@ def main1(lemma1, f, stats, lemma_names=None):
             print('ERRORS')
             print(e)
     done = sketcher.sketch_done(p)
-    lemmas = [x for x in done if x['type'] == 'lemma']
+    lemmas = [x for x in (done or []) if isinstance(x, dict) and x.get('type') == 'lemma']
+    # Fallback for files with TODO/empty bodies where sketch_done is empty.
+    if not lemmas:
+        try:
+            todo_lemmas = sketcher.sketch_todo_lemmas(p)
+        except Exception as e:
+            print(f"todo_lemmas failed: {e}")
+            todo_lemmas = []
+        # sketch_todo_lemmas can return the sentinel string "errors" when
+        # verifier errors exist but cannot be mapped to enclosing methods.
+        if todo_lemmas == "errors":
+            try:
+                todos = sketcher.sketch_todo(p)
+            except Exception as e:
+                print(f"todo fallback failed: {e}")
+                todos = []
+            lemmas = [x for x in (todos or []) if isinstance(x, dict) and x.get('type') == 'lemma']
+        else:
+            lemmas = [x for x in (todo_lemmas or []) if isinstance(x, dict) and x.get('type') == 'lemma']
+    if not lemmas:
+        print("No lemmas discovered (done/todo_lemmas/todo all empty).")
+        return
     for lemma in lemmas:
         if not lemma_names or lemma['name'] in lemma_names:
             try:
@@ -46,8 +67,18 @@ def run(lemma1, print_stats, only_lemmas=None, on_track=False):
     parser.add_argument('--on-track', action='store_true', help='Only run on track lemmas (for default glob pattern)')
     parser.add_argument('--for-poetry', action='store_true', help='Only run on the lemmas suitable for poetry')
     parser.add_argument('--glob-pattern', type=str, help='Glob pattern for solution files (default: "bench/*_solution.dfy")')
-    
+    parser.add_argument('--files-list', type=str, help='Path to a text file with one .dfy file path per line')
+
     args = parser.parse_args()
+
+    # Load file list from text file
+    if args.files_list:
+        with open(args.files_list) as fp:
+            extra = [line.strip() for line in fp if line.strip() and not line.startswith('#')]
+        if args.file:
+            args.file.extend(extra)
+        else:
+            args.file = extra
 
     if only_lemmas is None and args.glob_pattern is None and args.on_track:
         assertions_and_forall_needed = ["dedupCorrect", "maxIsCorrect"]
